@@ -14,6 +14,9 @@ export function routeHash(view = "dashboard", params = {}, fallback = {}) {
     if (clean(value("tab", "standings"))) query.set("tab", value("tab", "standings"));
     if (clean(value("activity"))) query.set("activity", value("activity"));
   }
+  if (view === "admin") {
+    if (clean(value("tab", "overview")) && value("tab", "overview") !== "overview") query.set("tab", value("tab", "overview"));
+  }
   if (view === "dashboard" && clean(value("activity"))) query.set("activity", value("activity"));
   if (view === "players") {
     if (Number(value("page", 1)) > 1) query.set("page", String(value("page", 1)));
@@ -42,6 +45,7 @@ export function parseRoute(hash = "") {
     teamTab: view === "team" ? params.get("tab") || "roster" : "",
     teamId: view === "team" ? params.get("team") || "" : "",
     leagueTab: view === "league" ? params.get("tab") || "standings" : "",
+    adminTab: view === "admin" ? params.get("tab") || "overview" : "",
     activityFilter: ["dashboard", "league"].includes(view) ? params.get("activity") || "all" : "",
     playersPage: view === "players" ? Math.max(1, Number(params.get("page") || 1)) : 1,
     position: ["players", "draft"].includes(view) ? params.get("position") || "ALL" : "",

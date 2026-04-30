@@ -11,6 +11,7 @@ test("player routes encode and parse player ids", () => {
     teamTab: "",
     teamId: "",
     leagueTab: "",
+    adminTab: "",
     activityFilter: "",
     playersPage: 1,
     position: "",
@@ -49,6 +50,15 @@ test("players routes preserve filters pagination trade target and waiver state",
   assert.equal(parsed.filter, "smith");
   assert.equal(parsed.tradeToTeam, "t3");
   assert.equal(parsed.waiverFilter, "pending");
+});
+
+test("commissioner routes preserve section tabs", () => {
+  const hash = routeHash("admin", { tab: "data" });
+  const parsed = parseRoute(hash);
+
+  assert.equal(hash, "#/admin?tab=data");
+  assert.equal(parsed.view, "admin");
+  assert.equal(parsed.adminTab, "data");
 });
 
 test("unknown routes fall back to dashboard", () => {

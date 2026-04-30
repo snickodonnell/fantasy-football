@@ -10,6 +10,7 @@ const state = {
   systemHealth: null,
   sessions: [],
   dryRun: null,
+  draftSimulation: null,
   theme: localStorage.getItem("ff-theme") || (window.matchMedia?.("(prefers-color-scheme: dark)")?.matches ? "dark" : "light"),
   filter: "",
   position: "ALL",
@@ -18,6 +19,7 @@ const state = {
   activityFilter: "all",
   teamTab: "roster",
   leagueTab: "standings",
+  adminTab: "overview",
   playersPage: 1,
   waiverFilter: "all",
   waiverEditId: null,
@@ -28,10 +30,26 @@ const state = {
   tradeCompareIds: [],
   counterTradeId: null,
   draftAudio: false,
+  draftTvMode: false,
   lastDraftPick: 0,
   lastDraftTimerStatus: "",
+  pendingAction: "",
+  dialog: null,
+  dialogResolve: null,
   toast: null,
-  error: ""
+  error: "",
+  index: {
+    playersById: new Map(),
+    teamsById: new Map(),
+    rostersByTeam: new Map(),
+    providerBySleeperId: new Map(),
+    providerByNameTeam: new Map(),
+    weeklyStatsByPlayer: new Map(),
+    researchByPlayer: new Map(),
+    tradeBlockByPlayer: new Map(),
+    availablePlayers: [],
+    rosteredPlayers: []
+  }
 };
 
 const nav = [
@@ -58,7 +76,7 @@ applyTheme();
 function routeHash(view = state.view, params = {}) {
   return makeRouteHash(view, params, {
     playerId: state.selectedPlayerId,
-    tab: view === "league" ? state.leagueTab : state.teamTab,
+    tab: view === "league" ? state.leagueTab : view === "admin" ? state.adminTab : state.teamTab,
     teamId: state.selectedTeam,
     activity: state.activityFilter === "all" ? "" : state.activityFilter,
     page: state.playersPage,
@@ -81,6 +99,7 @@ function applyRouteFromLocation() {
     state.leagueTab = route.leagueTab || "standings";
     state.activityFilter = route.activityFilter || "all";
   }
+  if (route.view === "admin") state.adminTab = route.adminTab || "overview";
   if (route.view === "dashboard") state.activityFilter = route.activityFilter || "all";
   if (route.view === "players") {
     state.playersPage = route.playersPage || 1;
@@ -130,7 +149,7 @@ async function bootstrap() {
   try {
     const session = await api("/api/session");
     state.user = session.user;
-    if (state.user) state.data = await api("/api/bootstrap");
+    if (state.user) setData(await api("/api/bootstrap"));
   } catch {
     state.user = null;
   }
@@ -144,21 +163,73 @@ function initials(value = "") {
 }
 
 function moneyTime(ts) {
-  const diff = Date.now() - ts;
+  const value = typeof ts === "string" ? Date.parse(ts) : ts;
+  const diff = Date.now() - value;
   if (diff < 60000) return "now";
   if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
   if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`;
   return `${Math.floor(diff / 86400000)}d ago`;
 }
 
+function dataKey(...parts) {
+  return parts.map((part) => String(part || "").trim().toLowerCase()).join("|");
+}
+
+function setData(data) {
+  state.data = data;
+  rebuildIndexes();
+}
+
+function rebuildIndexes() {
+  const data = state.data || {};
+  const index = {
+    playersById: new Map(),
+    teamsById: new Map(),
+    rostersByTeam: new Map(),
+    providerBySleeperId: new Map(),
+    providerByNameTeam: new Map(),
+    weeklyStatsByPlayer: new Map(),
+    researchByPlayer: new Map(),
+    tradeBlockByPlayer: new Map(),
+    availablePlayers: [],
+    rosteredPlayers: []
+  };
+  for (const team of data.teams || []) index.teamsById.set(team.id, team);
+  for (const player of data.players || []) {
+    index.playersById.set(player.id, player);
+    if (player.ownership) {
+      index.rosteredPlayers.push(player);
+      const rosterPlayers = index.rostersByTeam.get(player.ownership) || [];
+      rosterPlayers.push(player);
+      index.rostersByTeam.set(player.ownership, rosterPlayers);
+    } else {
+      index.availablePlayers.push(player);
+    }
+  }
+  index.availablePlayers.sort((a, b) => Number(b.projection || 0) - Number(a.projection || 0) || a.name.localeCompare(b.name));
+  for (const provider of data.providerPlayers || []) {
+    if (provider.provider === "sleeper") index.providerBySleeperId.set(String(provider.providerId), provider);
+    index.providerByNameTeam.set(dataKey(provider.name, provider.team), provider);
+    if (!provider.team) index.providerByNameTeam.set(dataKey(provider.name, ""), provider);
+  }
+  for (const stat of data.scoring?.weeklyStats || []) {
+    const rows = index.weeklyStatsByPlayer.get(stat.appPlayerId) || [];
+    rows.push(stat);
+    index.weeklyStatsByPlayer.set(stat.appPlayerId, rows);
+  }
+  for (const item of data.playerResearch || []) index.researchByPlayer.set(item.playerId, item);
+  for (const item of data.tradeBlock || []) index.tradeBlockByPlayer.set(item.playerId, item);
+  state.index = index;
+}
+
 function player(id) {
-  return state.data.players.find((item) => item.id === id);
+  return state.index.playersById.get(id);
 }
 
 function providerPlayerFor(appPlayer) {
   if (!appPlayer) return null;
-  if (appPlayer.id.startsWith("slp-")) return state.data.providerPlayers?.find((p) => p.provider === "sleeper" && p.providerId === appPlayer.id.replace("slp-", ""));
-  return state.data.providerPlayers?.find((p) => p.name?.toLowerCase() === appPlayer.name.toLowerCase() && (!p.team || p.team === appPlayer.nflTeam));
+  if (appPlayer.id.startsWith("slp-")) return state.index.providerBySleeperId.get(appPlayer.id.replace("slp-", ""));
+  return state.index.providerByNameTeam.get(dataKey(appPlayer.name, appPlayer.nflTeam)) || state.index.providerByNameTeam.get(dataKey(appPlayer.name, ""));
 }
 
 function playerLink(id, label) {
@@ -166,16 +237,21 @@ function playerLink(id, label) {
   return `<a class="link-button" href="${routeHash("player", { playerId: id })}" data-action="view-player" data-player="${id}">${label || p?.name || id}</a>`;
 }
 
+function draftPickLabel(pick) {
+  if (!pick?.playerId || pick.skipped) return "Skipped";
+  return playerLink(pick.playerId, pick.playerName);
+}
+
 function researchFor(playerId) {
-  return (state.data.playerResearch || []).find((item) => item.playerId === playerId) || { note: "", watchlist: false };
+  return state.index.researchByPlayer.get(playerId) || { note: "", watchlist: false };
 }
 
 function tradeBlockItem(playerId) {
-  return (state.data.tradeBlock || []).find((item) => item.playerId === playerId);
+  return state.index.tradeBlockByPlayer.get(playerId);
 }
 
 function team(id) {
-  return state.data.teams.find((item) => item.id === id);
+  return state.index.teamsById.get(id);
 }
 
 function teamAvatar(item, size = 34) {
@@ -193,7 +269,7 @@ function myTeam() {
 }
 
 function roster(teamId) {
-  return state.data.players.filter((item) => item.ownership === teamId);
+  return state.index.rostersByTeam.get(teamId) || [];
 }
 
 function lineupRows(teamId) {
@@ -268,10 +344,27 @@ function layout(content) {
         ${state.data.meta.setupRequired ? `<div class="setup-warning"><strong>Password setup required.</strong><span>Change the seeded password in Manager Settings before using league actions on the home network.</span><button data-view="settings">Go to Settings</button></div>` : ""}
         ${content}
         ${state.toast ? `<div class="toast ${state.toast.tone}" role="status">${state.toast.message}</div>` : ""}
+        ${dialogMarkup()}
       </main>
       <nav class="mobile-nav" aria-label="Mobile navigation">${navItems.map(([id, icon, label]) => `<a class="${state.view === id ? "active" : ""}" href="${routeHash(id)}" data-view="${id}" ${state.view === id ? 'aria-current="page"' : ""}><span>${icon}</span>${label}</a>`).join("")}</nav>
     </div>
   `;
+}
+
+function dialogMarkup() {
+  const dialog = state.dialog;
+  if (!dialog) return "";
+  return `<div class="modal-backdrop" role="presentation">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
+      <h3 id="dialog-title">${dialog.title}</h3>
+      <p class="small">${dialog.message || ""}</p>
+      ${dialog.kind === "text" ? `<label><span>${dialog.label || "Note"}</span><input data-dialog-input value="${dialog.defaultValue || ""}" autofocus></label>` : ""}
+      <div class="toolbar section-gap-sm">
+        <button data-action="dialog-cancel">Cancel</button>
+        <button class="primary" data-action="dialog-confirm">${dialog.confirmLabel || "Continue"}</button>
+      </div>
+    </div>
+  </div>`;
 }
 
 function phaseBadge() {
@@ -298,6 +391,12 @@ function dashboard() {
       <article class="card"><div class="between"><button class="icon">‹</button><div><h3>Week ${data.meta.currentWeek}</h3><p class="small">Oct 9 - Oct 15</p></div><button class="icon">›</button></div><a class="button-link primary full-link" href="${routeHash("team", { tab: "lineup" })}" data-view="team">Set Lineup</a></article>
       <article class="card"><h3>Top Scorer</h3><div class="score-row"><span class="avatar">SA</span><div><strong>Sophie A.</strong><div class="score">132.6 <span class="small">PTS</span></div><p class="small up">↑ 18.4 vs proj</p></div></div></article>
       <article class="card"><h3>League Highlight</h3><p class="small">The Parkers pulled off the biggest comeback of the week.</p><a class="button-link" href="${routeHash("matchups")}" data-view="matchups">View Recap</a></article>
+    </section>
+    ${announcementPanel()}
+    <section class="grid three-col section-gap">
+      <article class="card"><h3>What Can I Do Now?</h3>${phaseGuidancePanel()}</article>
+      <article class="card"><h3>First Login Setup</h3>${onboardingPanel()}</article>
+      <article class="card"><h3>Weekly Awards</h3>${awardsPanel()}</article>
     </section>
     <section class="grid two-col section-gap">
       <article class="card">
@@ -328,6 +427,26 @@ function dashboard() {
       <article class="card"><h3>Sleeper Players</h3><div class="score">${data.providerSync.counts?.sleeperPlayers || 0}</div><p class="small">${data.providerSync.counts?.trending || 0} trending records</p></article>
     </section>
   `);
+}
+
+function announcementPanel() {
+  const announcements = state.data.announcements || [];
+  if (!announcements.length) return "";
+  return `<section class="card section-gap"><h3>Pinned Announcement</h3>${announcements.slice(0, 2).map((item) => `<div class="waiver-item"><div><p><strong>${item.title}</strong></p><p class="small">${item.body}</p><p class="small">Expires ${new Date(item.expiresAt || Date.now()).toLocaleDateString()}</p></div>${isCommissioner() ? `<button data-action="announcement-unpin" data-announcement="${item.id}">Unpin</button>` : ""}</div>`).join("")}</section>`;
+}
+
+function phaseGuidancePanel() {
+  const guidance = state.data.phaseGuidance || {};
+  return `<div class="waiver-list">${(guidance.items || []).map((item) => `<div class="waiver-item"><p class="small">${item}</p></div>`).join("")}</div>`;
+}
+
+function onboardingPanel() {
+  const onboarding = state.data.onboarding || {};
+  return `<div class="waiver-list">${(onboarding.steps || []).map((step) => `<div class="waiver-item"><span class="pill ${step.done ? "Healthy" : "Questionable"}">${step.done ? "Done" : "Next"}</span><p class="small">${step.label}</p></div>`).join("")}</div>`;
+}
+
+function awardsPanel() {
+  return `<div class="waiver-list">${(state.data.family?.awards || []).map((award) => `<div class="waiver-item"><div><strong>${award.title}</strong><p class="small">${award.teamName || "TBD"} · ${award.detail}</p></div></div>`).join("")}</div>`;
 }
 
 function syncCounts() {
@@ -396,7 +515,7 @@ function draftBoard(draft) {
     rows.push(`<div class="draft-round"><strong>Round ${round}</strong><div class="draft-picks">${sequence.map((teamId, index) => {
       const pickNumber = (round - 1) * order.length + index + 1;
       const pick = picks[pickNumber];
-      return `<div class="draft-cell ${pickNumber === draft.currentPick ? "active" : ""} ${pick ? "made" : ""}"><span>${pickNumber}. ${team(teamId)?.manager || ""}</span><strong>${pick ? playerLink(pick.playerId, pick.playerName) : "Open"}</strong><small>${pick ? pick.position : team(teamId)?.name || ""}</small></div>`;
+      return `<div class="draft-cell ${pickNumber === draft.currentPick ? "active" : ""} ${pick ? "made" : ""}"><span>${pickNumber}. ${team(teamId)?.manager || ""}</span><strong>${pick ? draftPickLabel(pick) : "Open"}</strong><small>${pick ? pick.position : team(teamId)?.name || ""}</small></div>`;
     }).join("")}</div></div>`);
   }
   return `<div class="draft-board">${rows.join("")}</div>`;
@@ -444,7 +563,7 @@ function projectionTable(players) {
 }
 
 function teamStatsTable(players) {
-  const rows = players.flatMap((p) => (state.data.scoring.weeklyStats || []).filter((stat) => stat.appPlayerId === p.id).slice(0, 3).map((stat) => ({ p, stat })));
+  const rows = players.flatMap((p) => (state.index.weeklyStatsByPlayer.get(p.id) || []).slice(0, 3).map((stat) => ({ p, stat })));
   return rows.length ? `<table><thead><tr><th>Player</th><th>Week</th><th>Type</th><th>Pts</th></tr></thead><tbody>${rows.map(({ p, stat }) => `<tr><td>${playerLink(p.id, p.name)}</td><td>${stat.week}</td><td>${stat.statType}</td><td>${stat.fantasyPoints}</td></tr>`).join("")}</tbody></table>` : `<div class="empty">No cached weekly stats for this roster yet. Use Commissioner scoring ingestion when data is available.</div>`;
 }
 
@@ -486,7 +605,7 @@ function playerDetailView() {
   const owner = p.ownership ? team(p.ownership) : null;
   const provider = providerPlayerFor(p);
   const trends = (state.data.providerTrending || []).filter((t) => t.provider === "sleeper" && provider && t.providerId === provider.providerId);
-  const stats = (state.data.scoring.weeklyStats || []).filter((row) => row.appPlayerId === p.id).slice(0, 8);
+  const stats = (state.index.weeklyStatsByPlayer.get(p.id) || []).slice(0, 8);
   const games = (state.data.nflGames || []).filter((game) => gameMatchesPlayer(game, p)).slice(0, 8);
   const research = researchFor(p.id);
   return layout(`
@@ -639,10 +758,11 @@ function leagueView() {
   const byWeek = groupBy(state.data.matchups, "week");
   return layout(`
     <section class="page-head"><div><h2>League / Standings</h2><p>Full league standings with activity feed and chat.</p></div>${phaseBadge()}</section>
-    ${subtabBar("league", state.leagueTab, [["standings","Standings"],["schedule","Schedule"],["playoffs","Playoffs"],["transactions","Transactions"],["settings","League Settings"]])}
+    ${subtabBar("league", state.leagueTab, [["standings","Standings"],["schedule","Schedule"],["playoffs","Playoffs"],["history","History"],["transactions","Transactions"],["settings","League Settings"]])}
     ${state.leagueTab === "standings" ? `<section class="grid two-col"><article class="card"><h3>${state.data.league.name}</h3>${standingsTable(state.data.teams)}</article><article class="card"><h3>League Chat</h3>${chatBox(true)}</article></section>` : ""}
     ${state.leagueTab === "schedule" ? `<section class="card"><div class="between"><h3>Fantasy Schedule</h3>${isCommissioner() ? `<button data-action="generate-schedule">Generate Schedule</button>` : ""}</div><div class="schedule-grid">${Object.entries(byWeek).slice(0, 14).map(([week, games]) => `<div class="schedule-week"><strong>Week ${week}</strong>${games.map((game) => `<p class="small">${team(game.homeTeamId)?.name || game.homeTeamId} vs ${team(game.awayTeamId)?.name || game.awayTeamId}</p>`).join("")}</div>`).join("")}</div></section>` : ""}
     ${state.leagueTab === "playoffs" ? playoffView(league.playoffs) : ""}
+    ${state.leagueTab === "history" ? familyHistoryView() : ""}
     ${state.leagueTab === "transactions" ? `<section class="card"><h3>Transactions</h3>${transactionTable()}</section>` : ""}
     ${state.leagueTab === "settings" ? `<section class="grid three-col"><article class="card"><h3>Roster Rules</h3><p class="small">${league.roster.starters.join(", ")} + ${league.roster.bench} bench, ${league.roster.ir} IR</p><p class="small">${league.settings.scoringType}, ${league.settings.maxTeams} teams max</p></article><article class="card"><h3>Waivers & Trades</h3><p class="small">${league.waiver.type}, ${league.waiver.periodDays} days, ${league.waiver.weekly}</p><p class="small">Trade review: ${league.trade.review}, ${league.trade.rejectionDays} days</p></article><article class="card"><h3>Draft & Playoffs</h3><p class="small">${league.draft.type} | ${league.draft.pickTimeSeconds}s picks</p><p class="small">${league.playoffs.teams} playoff teams, Weeks ${league.playoffs.weeks}</p></article></section>` : ""}
     <section class="card section-gap">
@@ -651,6 +771,15 @@ function leagueView() {
       ${activityFeed(filteredActivity())}
     </section>
   `);
+}
+
+function familyHistoryView() {
+  const summary = state.data.family?.printableSummary;
+  return `<section class="grid two-col">
+    <article class="card"><h3>Matchup Recaps</h3><div class="waiver-list">${(state.data.family?.recaps || []).map((item) => `<div class="waiver-item"><div><strong>${item.title}</strong><p class="small">${item.body}</p><p class="small">${item.rivalryNote}</p></div></div>`).join("") || `<div class="empty">No recaps yet.</div>`}</div></article>
+    <article class="card"><h3>Trophy Room</h3><div class="waiver-list">${(state.data.family?.trophyRoom || []).map((item) => `<div class="waiver-item"><div><strong>${item.championName || "TBD"}</strong><p class="small">${item.season} · ${item.trophy}</p></div></div>`).join("") || `<div class="empty">No champions recorded yet.</div>`}</div></article>
+    <article class="card wide-card"><h3>Printable Weekly Summary</h3>${summary ? `<pre class="print-summary">${[summary.title, ...(summary.lines || [])].join("\n")}</pre><button onclick="window.print()">Print</button>` : `<div class="empty">No summary yet.</div>`}</article>
+  </section>`;
 }
 
 function transactionTable() {
@@ -703,10 +832,12 @@ function draftView() {
       <div><h2>Draft Room</h2><p>Live draft board with queues, keepers, chat, timer cues, and commissioner-controlled draft style.</p></div>
       <div class="toolbar">
         <button data-action="draft-audio">${state.draftAudio ? "Sound On" : "Enable Sound"}</button>
-        ${isCommissioner() ? `<button class="primary" data-action="draft-start" ${actionAllowed("draft") ? "" : "disabled"}>Start Draft</button>${["in_progress","paused"].includes(draft.status) ? `<button data-action="draft-pause" ${actionAllowed("draft") ? "" : "disabled"}>${draft.status === "paused" ? "Resume" : "Pause"}</button>` : ""}<button data-action="draft-test" ${actionAllowed("draft") ? "" : "disabled"}>Run Test Draft</button><button data-action="draft-reset" ${actionAllowed("draft") ? "" : "disabled"}>Reset Draft</button>` : ""}
+        <button data-action="draft-tv-toggle">${state.draftTvMode ? "Room View" : "TV Mode"}</button>
+        ${isCommissioner() ? `<button class="primary" data-action="draft-start" ${actionAllowed("draft") ? "" : "disabled"}>Start Draft</button>${["in_progress","paused"].includes(draft.status) ? `<button data-action="draft-pause" ${actionAllowed("draft") ? "" : "disabled"}>${draft.status === "paused" ? "Resume" : "Pause"}</button>` : ""}<button data-action="draft-simulate" ${actionAllowed("draft") ? "" : "disabled"}>Simulate Draft</button><button data-action="draft-test" ${actionAllowed("draft") ? "" : "disabled"}>Run Test Draft</button><button data-action="draft-reset" ${actionAllowed("draft") ? "" : "disabled"}>Reset Draft</button>` : ""}
       </div>
     </section>
     ${phaseNotice("draft", "draft")}
+    ${state.draftTvMode ? draftTvPanel(draft, currentTeam, timer) : ""}
     <section class="draft-stage ${timer.status}">
       <div>
         <p class="small">On clock</p>
@@ -714,14 +845,15 @@ function draftView() {
         <p class="small">Pick ${draft.currentPick || 1} of ${(draft.order?.length || 0) * (draft.rounds || 15)} · ${labelize(draft.orderStyle || "snake")}</p>
       </div>
       <div class="draft-clock ${timer.status}"><span>${timer.label}</span><small>${timer.caption}</small></div>
-      ${isCommissioner() ? `<div class="toolbar"><button data-action="draft-autopick">Autopick</button><button data-action="draft-undo">Undo</button></div>` : ""}
+      ${isCommissioner() ? `<div class="toolbar"><button data-action="draft-autopick">Autopick</button><button data-action="draft-skip">Skip</button><button data-action="draft-undo">Undo</button></div>` : ""}
     </section>
     <section class="grid three-col section-gap">
-      <article class="card"><h3>Status</h3><div class="score">${draft.status.replace("_", " ")}</div><p class="small">${draft.picks?.length || 0} picks made</p><p class="small">Timer: ${draft.pickTimeSeconds || 60}s</p></article>
+      <article class="card"><h3>Status</h3><div class="score">${draft.status.replace("_", " ")}</div><p class="small">${draft.picks?.length || 0} picks made</p><p class="small">Timer: ${draft.pickTimeSeconds || 60}s</p>${draftRecoveryStatus(draft)}</article>
       <article class="card"><h3>Draft Order</h3>${draftOrderList(draft)}</article>
-      <article class="card"><h3>Recent Picks</h3>${draft.picks?.length ? draft.picks.slice(-8).reverse().map((pick) => `<p class="small"><strong>${pick.pickNumber}.</strong> ${playerLink(pick.playerId, pick.playerName)} (${pick.position}) to ${team(pick.teamId)?.name}</p>`).join("") : `<div class="empty">No picks yet.</div>`}</article>
+      <article class="card"><h3>Recent Picks</h3>${draft.picks?.length ? draft.picks.slice(-8).reverse().map((pick) => `<p class="small"><strong>${pick.pickNumber}.</strong> ${draftPickLabel(pick)} (${pick.position}) to ${team(pick.teamId)?.name}</p>`).join("") : `<div class="empty">No picks yet.</div>`}</article>
     </section>
-    ${isCommissioner() ? `<section class="card section-gap"><h3>Commissioner Draft Setup</h3>${draftConfigForm(draft)}<h3 class="stack-heading">Keepers</h3>${keeperTools(draft)}</section>` : ""}
+    ${isCommissioner() ? `<section class="card section-gap"><h3>Commissioner Draft Setup</h3>${draftConfigForm(draft)}<h3 class="stack-heading">Draft Night Overrides</h3>${draftOverrideTools(draft)}<h3 class="stack-heading">Keepers</h3>${keeperTools(draft)}</section>` : ""}
+    ${isCommissioner() && state.draftSimulation ? draftSimulationPanel(state.draftSimulation) : ""}
     <section class="grid two-col section-gap">
       <article class="card">
         <div class="toolbar"><input placeholder="Search draft board" value="${state.filter}" data-action="filter"><select data-action="position"><option>ALL</option>${["QB","RB","WR","TE","FLEX","D/ST","K"].map((p) => `<option ${state.position === p ? "selected" : ""}>${p}</option>`).join("")}</select></div>
@@ -736,6 +868,71 @@ function draftView() {
       <article class="card"><h3>Draft Chat</h3>${draftChat(draft)}</article>
     </section>
   `);
+}
+
+function draftSimulationPanel(sim) {
+  const firstRound = (sim.picks || []).slice(0, state.data.teams.length);
+  return `<section class="card section-gap">
+    <div class="between"><h3>Draft Rehearsal</h3><span class="pill Healthy">${sim.picks.length} picks</span></div>
+    <p class="small">${sim.rounds} rounds, ${labelize(sim.orderStyle)}. Real rosters were ${sim.sourceChanged ? "changed" : "not changed"}.</p>
+    ${sim.warnings?.length ? `<div class="empty empty-left">${sim.warnings.join(" ")}</div>` : ""}
+    <div class="grid two-col section-gap-sm">
+      <div>
+        <h3>First Round</h3>
+        ${firstRound.map((pick) => `<p class="small"><strong>${pick.pickNumber}.</strong> ${pick.playerName} (${pick.position}) to ${team(pick.teamId)?.name || pick.teamId}</p>`).join("")}
+      </div>
+      <div>
+        <h3>Roster Totals</h3>
+        ${(sim.rosters || []).map((item) => `<p class="between small"><span>${item.teamName}</span><strong>${item.rosterSize} / ${item.projectedPoints}</strong></p>`).join("")}
+      </div>
+    </div>
+  </section>`;
+}
+
+function draftRecoveryStatus(draft) {
+  const recovery = draft.recovery || {};
+  const saved = recovery.lastSavedAt ? moneyTime(recovery.lastSavedAt) : "Not saved yet";
+  return `<div class="draft-recovery">
+    <p class="small">Saved: ${saved}</p>
+    <p class="small">Recovery pick: ${recovery.currentPick || draft.currentPick || 1}</p>
+    ${isCommissioner() && recovery.canResume ? `<button data-action="draft-recover">Recover Clock</button>` : ""}
+  </div>`;
+}
+
+function draftOverrideTools(draft) {
+  const completed = (draft.picks || []).filter((pick) => pick.pickNumber);
+  const available = state.index.availablePlayers.slice(0, 250);
+  const pickOptions = completed.map((pick) => `<option value="${pick.pickNumber}">${pick.pickNumber}. ${team(pick.teamId)?.name || pick.teamId} - ${pick.playerName || "Skipped"}</option>`).join("");
+  const playerOptions = available.map((p) => `<option value="${p.id}">${p.name} (${p.position}, ${p.nflTeam})</option>`).join("");
+  return `<div class="override-grid">
+    <form class="toolbar" data-form="draft-replace-pick">
+      <select name="pickNumber">${pickOptions}</select>
+      <select name="playerId">${playerOptions}</select>
+      <button>Replace Pick</button>
+    </form>
+    <form class="toolbar" data-form="draft-swap-picks">
+      <select name="firstPickNumber">${pickOptions}</select>
+      <select name="secondPickNumber">${pickOptions}</select>
+      <button>Swap Picks</button>
+    </form>
+    <p class="small">Skip is next to Autopick on the clock. Replacements use available players and keep the original pick team.</p>
+  </div>`;
+}
+
+function draftTvPanel(draft, currentTeam, timer) {
+  const recent = (draft.picks || []).slice(-5).reverse();
+  return `<section class="draft-tv-panel ${timer.status}">
+    <div>
+      <p class="small">On clock</p>
+      <h3>${currentTeam?.name || "-"}</h3>
+      <p>Pick ${draft.currentPick || 1} · ${labelize(draft.orderStyle || "snake")}</p>
+    </div>
+    <div class="draft-tv-clock">${timer.label}<span>${timer.caption}</span></div>
+    <div>
+      <p class="small">Recent picks</p>
+      ${recent.map((pick) => `<p><strong>${pick.pickNumber}.</strong> ${pick.skipped ? "Skipped" : pick.playerName} <span>${team(pick.teamId)?.manager || ""}</span></p>`).join("") || `<p>No picks yet.</p>`}
+    </div>
+  </section>`;
 }
 
 function draftTimerState(draft) {
@@ -786,7 +983,7 @@ function keeperTools(draft) {
   const keepers = draft.keepers || [];
   return `<form class="toolbar" data-form="draft-keeper">
     <select name="teamId">${state.data.teams.map((item) => `<option value="${item.id}">${item.name}</option>`).join("")}</select>
-    <select name="playerId">${state.data.players.filter((p) => p.ownership).map((p) => `<option value="${p.id}">${p.name} (${team(p.ownership)?.name || "Rostered"})</option>`).join("")}</select>
+    <select name="playerId">${state.index.rosteredPlayers.map((p) => `<option value="${p.id}">${p.name} (${team(p.ownership)?.name || "Rostered"})</option>`).join("")}</select>
     <input class="input-xs" name="round" type="number" min="1" value="1">
     <input name="note" placeholder="Keeper note">
     <button>Add Keeper</button>
@@ -809,8 +1006,9 @@ function playersView() {
   const activeTeam = myTeam();
   const activeRoster = roster(activeTeam.id);
   const pageSize = 50;
+  const search = state.filter.trim().toLowerCase();
   const filtered = state.data.players.filter((p) =>
-    (!state.filter || p.name.toLowerCase().includes(state.filter.toLowerCase()) || p.nflTeam.toLowerCase().includes(state.filter.toLowerCase())) &&
+    (!search || p.name.toLowerCase().includes(search) || p.nflTeam.toLowerCase().includes(search)) &&
     (state.position === "ALL" || p.position === state.position)
   );
   const maxPage = Math.max(1, Math.ceil(filtered.length / pageSize));
@@ -819,13 +1017,18 @@ function playersView() {
   return layout(`
     <section class="page-head"><div><h2>Players</h2><p>Search free agents, add players, submit waiver claims, and start trades.</p></div></section>
     <div class="toolbar"><input placeholder="Search players" value="${state.filter}" data-action="filter"><select data-action="position"><option>ALL</option>${["QB","RB","WR","TE","FLEX","D/ST","K"].map((p) => `<option ${state.position === p ? "selected" : ""}>${p}</option>`).join("")}</select><button data-action="sync">Sync Provider</button></div>
+    <section class="grid three-col section-gap">
+      <article class="card"><h3>Roster Health</h3>${rosterHealthPanel()}</article>
+      <article class="card"><h3>Start / Sit</h3>${startSitPanel()}</article>
+      <article class="card"><h3>Matchup & Bye View</h3>${matchupStrengthPanel()}</article>
+    </section>
     <section class="grid two-col">
       <article class="card"><div class="between"><h3>Player Pool</h3>${pager(filtered.length, state.playersPage, pageSize, "players-page")}</div><table><thead><tr><th>Pos</th><th>Player</th><th>Team</th><th>Status</th><th>Proj</th><th></th></tr></thead><tbody>${pageItems.map((p) => `<tr><td>${p.position}</td><td>${playerLink(p.id, p.name)}</td><td>${p.nflTeam}</td><td>${statusPill(p.status)}</td><td>${p.projection}</td><td>${playerAction(p, activeTeam)}</td></tr>`).join("")}</tbody></table>${pager(filtered.length, state.playersPage, pageSize, "players-page")}</article>
       <aside class="card">
         <h3>Submit Waiver Claim</h3>
         <form class="form-grid" data-form="waiver-claim">
           <input name="teamId" type="hidden" value="${activeTeam.id}">
-          <select name="addPlayerId">${state.data.players.filter((p) => !p.ownership).slice(0, 300).map((p) => `<option value="${p.id}">${p.name} (${p.position} ${p.nflTeam})</option>`).join("")}</select>
+          <select name="addPlayerId">${state.index.availablePlayers.slice(0, 300).map((p) => `<option value="${p.id}">${p.name} (${p.position} ${p.nflTeam})</option>`).join("")}</select>
           <select name="dropPlayerId"><option value="">No drop</option>${activeRoster.map((p) => `<option value="${p.id}">${p.name} (${p.position})</option>`).join("")}</select>
           <button ${actionAllowed("waiver") ? "" : "disabled"}>Submit Claim</button>
         </form>
@@ -835,10 +1038,29 @@ function playersView() {
         ${state.tradeCompareIds.length ? `<h3 class="stack-heading">Compare Offer</h3>${playerComparison(state.tradeCompareIds)}` : ""}
         <h3 class="stack-heading">Trade Block</h3>${tradeBlockList(activeTeam)}
         <h3 class="stack-heading">Watchlist</h3>${watchlistPanel()}
+        <h3 class="stack-heading">Trade Fairness</h3>${tradeFairnessPanel()}
         <h3 class="stack-heading">Trades</h3>${tradesList()}
       </aside>
     </section>
   `);
+}
+
+function tradeFairnessPanel() {
+  const items = state.data.researchTools?.tradeFairness || [];
+  return items.length ? `<div class="waiver-list">${items.map((item) => `<div class="waiver-item"><p class="small"><strong>${item.label}</strong>: offered ${item.offeredValue}, requested ${item.requestedValue}</p></div>`).join("")}</div>` : `<div class="empty">No trade offers to compare.</div>`;
+}
+
+function rosterHealthPanel() {
+  const health = state.data.researchTools?.rosterHealth || {};
+  return `<div class="score">${health.score ?? "-"}</div><p class="small">${health.flags || 0} status flags · ${health.rosterSize || 0}/${health.limit || 0} roster spots</p>`;
+}
+
+function startSitPanel() {
+  return `<div class="waiver-list">${(state.data.researchTools?.startSit || []).slice(0, 5).map((item) => `<div class="waiver-item"><div><strong>${item.recommendation}</strong><p class="small">${playerLink(item.playerId, item.playerName)} · ${item.position} · ${item.projection}</p></div></div>`).join("") || `<div class="empty">No roster players.</div>`}</div>`;
+}
+
+function matchupStrengthPanel() {
+  return `<div class="waiver-list">${(state.data.researchTools?.matchupStrength || []).slice(0, 5).map((item) => `<div class="waiver-item"><p class="small">${playerLink(item.playerId, item.playerName)} · ${item.strength} · Bye ${item.byeWeek}</p></div>`).join("")}</div>`;
 }
 
 function waiverList() {
@@ -1015,11 +1237,24 @@ function adminView() {
   if (!isCommissioner()) return layout(`<section class="page-head"><div><h2>Commissioner</h2><p>Commissioner access is required.</p></div></section>`);
   const league = state.data.league;
   const scoring = league.scoring;
-  return layout(`
-    <section class="page-head"><div><h2>Commissioner</h2><p>Manage family accounts, passwords, league settings, and local data sync.</p></div></section>
+  const tabs = [
+    ["overview", "Overview"],
+    ["people", "People"],
+    ["operations", "Operations"],
+    ["data", "Data"],
+    ["rules", "Rules"]
+  ];
+  const activeTab = tabs.some(([id]) => id === state.adminTab) ? state.adminTab : "overview";
+  const tabNav = `<nav class="subtabs admin-tabs" aria-label="Commissioner sections">${tabs.map(([id, label]) => `<a class="subtab ${activeTab === id ? "active" : ""}" href="${routeHash("admin", { tab: id })}" data-action="admin-tab" data-tab="${id}" ${activeTab === id ? 'aria-current="page"' : ""}>${label}</a>`).join("")}</nav>`;
+  const sections = {
+    overview: `
     <section class="card section-gap">
       <div class="between"><h3>Home Server Health</h3><div class="toolbar"><button data-action="refresh-health">Refresh</button><button data-action="run-backup">Create Backup</button></div></div>
       <div id="admin-health">${systemHealthPanel(state.systemHealth)}</div>
+    </section>
+    <section class="card section-gap">
+      <div class="between"><h3>Launch Readiness</h3><span class="pill ${state.data.ops?.launchReadiness?.ready ? "Healthy" : "Questionable"}">${state.data.ops?.launchReadiness?.summary?.ready || 0}/${state.data.ops?.launchReadiness?.summary?.total || 0} ready</span></div>
+      ${launchReadinessPanel(state.data.ops?.launchReadiness)}
     </section>
     <section class="card section-gap">
       <div class="between"><h3>Commissioner Command Center</h3><div class="toolbar"><button data-action="dry-run-phase">Preview Phase</button><button data-action="dry-run-playoffs">Preview Playoffs</button></div></div>
@@ -1028,13 +1263,19 @@ function adminView() {
       ${state.dryRun ? dryRunPanel(state.dryRun) : ""}
     </section>
     <section class="card section-gap">
-      <div class="between"><h3>Data Quality</h3><div class="toolbar"><button data-action="repair-orphans">Repair Orphans</button></div></div>
-      ${dataQualityPanel(state.data.ops?.dataQuality)}
+      <h3>Weekly Operations</h3>
+      ${weeklyOpsPanel(state.data.ops?.weekly)}
     </section>
     <section class="card section-gap">
-      <div class="between"><h3>Provider Reliability</h3><div class="toolbar"><button data-action="provider-snapshot">Snapshot Provider Cache</button></div></div>
-      ${providerOpsPanel(state.data.ops)}
-    </section>
+      <h3>Commissioner Announcement</h3>
+      <form class="form-grid" data-form="announcement">
+        <input name="title" placeholder="Announcement title">
+        <textarea name="body" placeholder="Pinned note for the league"></textarea>
+        <input name="expiresInDays" type="number" min="1" value="7" placeholder="Days">
+        <button>Pin Announcement</button>
+      </form>
+    </section>`,
+    people: `
     <section class="card section-gap">
       <h3>Season Control</h3>
       <form class="toolbar" data-form="season-phase">
@@ -1048,6 +1289,7 @@ function adminView() {
       <article class="card">
         <div class="between"><h3>Family Setup</h3><button data-action="setup-family">Apply Family Defaults</button></div>
         <p class="small">Creates/updates Nick, Emily, Hadley, Sarah Kate, Dawson, and Sawyer with editable placeholder teams.</p>
+        <div class="empty empty-left">${state.data.onboarding?.inviteInstructions?.commissioner || ""}</div>
         <h3 class="stack-heading">Add Account</h3>
         <form class="form-grid" data-form="add-user">
           <input name="displayName" placeholder="Display name">
@@ -1062,6 +1304,15 @@ function adminView() {
     <section class="card section-gap">
       <h3>Teams</h3>
       <div class="team-edit-grid">${state.data.teams.map((item) => `<form class="form-grid team-edit" data-form="team-settings" data-team="${item.id}">${teamAvatar(item)}<input name="name" value="${item.name}"><input name="manager" value="${item.manager}"><input name="logoUrl" value="${item.logoUrl || ""}" placeholder="Logo URL"><input name="color" type="color" value="${item.color || "#4f7ee8"}"><button>Save</button></form>`).join("")}</div>
+    </section>`,
+    data: `
+    <section class="card section-gap">
+      <div class="between"><h3>Data Quality</h3><div class="toolbar"><button data-action="repair-orphans">Repair Orphans</button></div></div>
+      ${dataQualityPanel(state.data.ops?.dataQuality)}
+    </section>
+    <section class="card section-gap">
+      <div class="between"><h3>Provider Reliability</h3><div class="toolbar"><button data-action="provider-snapshot">Snapshot Provider Cache</button></div></div>
+      ${providerOpsPanel(state.data.ops)}
     </section>
     <section class="card section-gap">
       <div class="between"><h3>Data Tools</h3><div class="toolbar"><button data-action="export-data">Export League JSON</button><button data-action="backup-sqlite">Backup SQLite</button></div></div>
@@ -1072,7 +1323,8 @@ function adminView() {
         <textarea name="csv" placeholder="team,player&#10;The Andersons,Josh Allen&#10;The Parkers,Christian McCaffrey"></textarea>
         <div class="toolbar"><button type="button" data-action="dry-run-import">Preview Import</button><button>Import CSV</button></div>
       </form>
-    </section>
+    </section>`,
+    operations: `
     <section class="card section-gap">
       <h3>Scoring Operations</h3>
       <p class="small">Ingest weekly stats/projections, process matchup scores, lock started players, finalize standings, and apply manual corrections.</p>
@@ -1091,7 +1343,7 @@ function adminView() {
       <form class="settings-form" data-form="correction">
         <div class="settings-grid">
           <label><span>Team</span><select name="teamId"><option value="">No team</option>${state.data.teams.map((item) => `<option value="${item.id}">${item.name}</option>`).join("")}</select></label>
-          <label><span>Player</span><select name="playerId"><option value="">Team-only correction</option>${state.data.players.filter((p) => p.ownership).slice(0, 350).map((p) => `<option value="${p.id}">${p.name} (${team(p.ownership)?.name || "FA"})</option>`).join("")}</select></label>
+          <label><span>Player</span><select name="playerId"><option value="">Team-only correction</option>${state.index.rosteredPlayers.slice(0, 350).map((p) => `<option value="${p.id}">${p.name} (${team(p.ownership)?.name || "FA"})</option>`).join("")}</select></label>
           ${field("pointsDelta", "Point Delta", 0, "number", "0.01")}
           ${field("note", "Correction Note", "")}
         </div>
@@ -1102,6 +1354,7 @@ function adminView() {
     <section class="card section-gap">
       <h3>Notification Preferences</h3>
       <p class="small">Updates are local and per user now. The stored event delivery metadata is ready for push/email later.</p>
+      ${digestPreviewPanel()}
       <form class="settings-form" data-form="notifications">
         <div class="settings-grid">
           ${notificationCheckbox("roster", "Roster Moves")}
@@ -1132,11 +1385,13 @@ function adminView() {
     <section class="card section-gap">
       <div class="between"><h3>League Event Timeline</h3><span class="small">${state.data.auditLog?.length || 0} entries · create a backup before rollback-style repairs</span></div>
       ${auditLogTable()}
-    </section>
+    </section>`,
+    rules: `
     <section class="card section-gap">
       <h3>League Rules</h3>
       <p class="small">Seeded from Yahoo default football settings, then fully configurable here.</p>
       <form class="settings-form" data-form="league">
+        ${ruleValidationPreview()}
         <div class="settings-section">
           <h3>General</h3>
           <div class="settings-grid">
@@ -1165,20 +1420,27 @@ function adminView() {
           <h3>Waivers, Trades, Draft, Playoffs</h3>
           <div class="settings-grid">
             ${field("waiverType", "Waiver Type", league.waiver.type)}
+            <label><span>Waiver Mode</span><select name="waiverMode"><option value="rolling" ${league.waiver.mode === "rolling" ? "selected" : ""}>Rolling Priority</option><option value="faab" ${league.waiver.mode === "faab" ? "selected" : ""}>FAAB</option><option value="free_agent_windows" ${league.waiver.mode === "free_agent_windows" ? "selected" : ""}>Free-Agent Windows</option></select></label>
             ${field("waiverPeriodDays", "Waiver Days", league.waiver.periodDays, "number")}
             ${field("weeklyWaivers", "Weekly Waivers", league.waiver.weekly)}
-            ${field("waiverBudget", "Waiver Budget (Unused)", 0, "number")}
+            ${field("waiverBudget", "Waiver Budget", league.waiver.budget || 100, "number")}
+            ${field("freeAgentWindows", "Free-Agent Windows", league.waiver.freeAgentWindows || "Wed-Sun")}
             ${checkbox("allowFreeAgentAdds", "Allow Free Agent Adds", league.waiver.allowFreeAgentAdds !== false)}
             ${checkbox("allowWaiverAdds", "Allow Waiver Claims", league.waiver.allowWaiverAdds !== false)}
             ${checkbox("allowInjuredToIR", "Allow Injured Directly To IR", league.waiver.allowInjuredToIR)}
             ${field("tradeReview", "Trade Review", league.trade.review)}
             ${field("tradeRejectionDays", "Trade Reject Days", league.trade.rejectionDays, "number")}
+            ${field("tradeDeadline", "Trade Deadline", league.trade.deadline || "Season default")}
+            ${field("playoffRosterLock", "Playoff Roster Lock", league.trade.playoffRosterLock || "Lock eliminated teams")}
             ${checkbox("allowDraftPickTrades", "Allow Draft Pick Trades", league.trade.allowDraftPickTrades)}
             ${field("draftType", "Draft Type", league.draft.type)}
             ${field("pickTimeSeconds", "Pick Time Seconds", league.draft.pickTimeSeconds, "number")}
             ${field("playoffTeams", "Playoff Teams", league.playoffs.teams, "number")}
             ${field("playoffWeeks", "Playoff Weeks", league.playoffs.weeks)}
             ${field("consolationTeams", "Consolation Teams", league.playoffs.consolationTeams, "number")}
+            ${field("playoffFormat", "Playoff Format", league.playoffs.format || "Semifinal + Championship")}
+            ${field("rosterTemplate", "Roster Template", league.roster.template || "Yahoo default")}
+            ${field("positionEligibility", "Position Eligibility", league.roster.positionEligibility || "FLEX=RB/WR/TE")}
             ${checkbox("playoffReseeding", "Playoff Reseeding", league.playoffs.reseeding)}
             ${checkbox("lockEliminatedTeams", "Lock Eliminated Teams", league.playoffs.lockEliminatedTeams)}
           </div>
@@ -1191,7 +1453,27 @@ function adminView() {
         </div>
         <button class="primary">Save League Rules</button>
       </form>
+    </section>`
+  };
+  if (activeTab === "overview") sections.overview += `
+    <section class="card section-gap">
+      <div class="between"><h3>Seeded Rehearsal</h3><button data-action="rehearsal-run">Verify Rehearsal</button></div>
+      ${rehearsalPanel(state.data.ops?.rehearsal)}
+    </section>`;
+  if (activeTab === "data") sections.data = `
+    <section class="card section-gap">
+      <h3>Real League Setup Review</h3>
+      ${setupReviewPanel(state.data.ops?.setupReview)}
     </section>
+    <section class="card section-gap">
+      <h3>Live Operations Readiness</h3>
+      ${liveOpsPanel(state.data.ops?.liveOps)}
+    </section>
+    ${sections.data}`;
+  return layout(`
+    <section class="page-head"><div><h2>Commissioner</h2><p>Manage family accounts, league operations, rules, and local data sync.</p></div></section>
+    ${tabNav}
+    <div class="admin-tab-panel">${sections[activeTab]}</div>
   `);
 }
 
@@ -1199,6 +1481,11 @@ function settingsView() {
   const activeTeam = myTeam();
   return layout(`
     <section class="page-head"><div><h2>Manager Settings</h2><p>Profile, password, team identity, and local notification preferences.</p></div></section>
+    <section class="card section-gap">
+      <h3>Setup Wizard</h3>
+      ${onboardingPanel()}
+      <div class="empty empty-left section-gap-sm"><p>${state.data.onboarding?.inviteInstructions?.manager || ""}</p><p>${state.data.onboarding?.inviteInstructions?.expires || ""}</p></div>
+    </section>
     <section class="grid two-col">
       <article class="card appearance-card">
         <h3>Appearance</h3>
@@ -1336,6 +1623,55 @@ function readinessPanel(readiness) {
   </div>`;
 }
 
+function launchReadinessPanel(readiness) {
+  if (!readiness) return `<div class="empty">Launch readiness unavailable.</div>`;
+  const summary = readiness.summary || {};
+  return `<div class="launch-readiness">
+    <div class="job-grid">
+      <div class="health-tile ${summary.blockers ? "warning" : "ok"}"><strong>Blockers</strong><span>${summary.blockers || 0}</span></div>
+      <div class="health-tile ${summary.warnings ? "warning" : "ok"}"><strong>Warnings</strong><span>${summary.warnings || 0}</span></div>
+      <div class="health-tile"><strong>Ready Items</strong><span>${summary.ready || 0}</span></div>
+      <div class="health-tile"><strong>Rostered Teams</strong><span>${summary.rosteredTeams || 0}</span></div>
+    </div>
+    <div class="readiness-list section-gap-sm">
+      ${(readiness.checks || []).map((check) => `<div class="check-item ${check.status === "ready" ? "ok" : "warn"}">
+        <span>${check.status === "ready" ? "✓" : "!"}</span>
+        <div><strong>${check.label}</strong><p class="small">${check.detail}</p></div>
+        ${check.target ? `<button data-action="launch-jump" data-view-target="${check.target.view || "admin"}" data-tab-target="${check.target.tab || ""}" data-linked-action="${check.target.action || ""}">Go</button>` : ""}
+      </div>`).join("")}
+    </div>
+  </div>`;
+}
+
+function rehearsalPanel(rehearsal = {}) {
+  const last = rehearsal.last;
+  return `<div class="launch-readiness">
+    <div class="empty empty-left">${last ? `<p>Last verified ${new Date(last.ranAt).toLocaleString()} with ${last.blockers} blocker(s) and ${last.warnings} warning(s).</p>` : "<p>No rehearsal verification has been recorded yet.</p>"}</div>
+    <div class="readiness-list section-gap-sm">${(rehearsal.steps || []).map((step) => `<div class="check-item ok"><span>✓</span><div><strong>${step.actor}</strong><p class="small">${step.label}</p></div><button data-action="launch-jump" data-view-target="${step.target?.view || "dashboard"}" data-tab-target="${step.target?.tab || ""}">Go</button></div>`).join("")}</div>
+  </div>`;
+}
+
+function setupReviewPanel(review = {}) {
+  const issues = review.impossible || [];
+  return `<div class="launch-readiness">
+    <div class="job-grid">
+      <div class="health-tile"><strong>Users</strong><span>${review.users?.total || 0}</span><p class="small">${review.users?.seededPasswords || 0} seeded password(s)</p></div>
+      <div class="health-tile"><strong>Teams</strong><span>${review.teams?.assigned || 0}/${review.teams?.total || 0}</span><p class="small">Assigned managers</p></div>
+      <div class="health-tile"><strong>Rosters</strong><span>${review.rosters?.rosteredTeams || 0}</span><p class="small">${review.rosters?.players || 0} players available</p></div>
+      <div class="health-tile"><strong>Draft</strong><span>${review.draft?.orderSlots || 0}</span><p class="small">${review.draft?.rounds || 0} rounds · ${review.draft?.style || "snake"}</p></div>
+    </div>
+    <div class="toolbar section-gap-sm"><a class="button-link" href="/api/admin/templates/rosters.csv">Roster CSV Template</a><a class="button-link" href="/api/admin/templates/draft.csv">Draft CSV Template</a></div>
+    ${issues.length ? `<div class="empty empty-left section-gap-sm">${issues.slice(0, 8).map((issue) => `<p>${issue}</p>`).join("")}</div>` : `<div class="empty ok section-gap-sm">No impossible setup states detected.</div>`}
+  </div>`;
+}
+
+function liveOpsPanel(live = {}) {
+  return `<div class="launch-readiness">
+    <div class="readiness-list">${(live.checks || []).map((check) => `<div class="check-item ${check.status === "ready" ? "ok" : "warn"}"><span>${check.status === "ready" ? "✓" : "!"}</span><div><strong>${check.label}</strong><p class="small">${check.detail}</p></div></div>`).join("")}</div>
+    <div class="toolbar section-gap-sm"><button data-action="player-sync-run">Run Smart Sync Step</button><button data-action="ingest-stats">Ingest Actual Stats</button><button data-action="validate-rosters">Validate Rosters</button></div>
+  </div>`;
+}
+
 function scheduledJobsPanel(jobs) {
   if (!jobs) return "";
   return `<div class="job-grid section-gap-sm">
@@ -1343,6 +1679,17 @@ function scheduledJobsPanel(jobs) {
     <div class="health-tile"><strong>Scoring Refresh</strong><span>${jobs.scoringRefresh.cadenceMinutes}m</span><p class="small">${jobs.scoringRefresh.message}</p></div>
     <div class="health-tile"><strong>Backups</strong><span>${jobs.backups.cadenceHours}h</span><p class="small">${jobs.backups.retention} retained</p></div>
     <div class="health-tile"><strong>Waivers</strong><span>${jobs.waivers.pending}</span><p class="small">${jobs.waivers.mode}</p></div>
+  </div>`;
+}
+
+function weeklyOpsPanel(weekly = {}) {
+  const previews = weekly.matchupPreviews || [];
+  const checklist = weekly.finalizationChecklist || [];
+  return `<div class="grid two-col">
+    <div><h3>Matchup Preview</h3><div class="waiver-list">${previews.slice(0, 4).map((item) => `<div class="waiver-item"><div><strong>${team(item.homeTeamId)?.name} vs ${team(item.awayTeamId)?.name}</strong><p class="small">Favorite: ${team(item.favoriteTeamId)?.name} by ${item.spread}</p><p class="small">${item.notes.join(" · ")}</p></div></div>`).join("") || `<div class="empty">No current matchup previews.</div>`}</div></div>
+    <div><h3>Finalization Checklist</h3><div class="readiness-list">${checklist.map((check) => `<div class="check-item ${check.ok ? "ok" : "warn"}"><span>${check.ok ? "✓" : "!"}</span><div><strong>${check.label}</strong><p class="small">${check.detail}</p></div></div>`).join("")}</div></div>
+    <div><h3>Lineup Locks</h3><div class="waiver-list">${(weekly.lineupLockCountdowns || []).slice(0, 6).map((item) => `<div class="waiver-item"><p class="small"><strong>${item.teamName}</strong>: ${item.nextLock?.playerName || "No player"} ${item.nextLock ? `${Math.floor(item.nextLock.secondsUntil / 3600)}h` : ""}</p></div>`).join("")}</div></div>
+    <div><h3>Waiver Queue</h3><p class="small">${weekly.waiverSchedule?.mode || "rolling"} · ${weekly.waiverSchedule?.processDay || "Tuesday"} · ${weekly.waiverSchedule?.pending || 0} pending</p>${waiverProcessPreview()}</div>
   </div>`;
 }
 
@@ -1370,16 +1717,24 @@ function dataQualityPanel(report) {
 
 function providerOpsPanel(ops = {}) {
   const settings = ops.providerSettings || {};
+  const service = ops.playerSyncService || {};
+  const plan = ops.playerSyncPlan || {};
   const candidates = ops.dataQuality?.providerCandidates || [];
   const snapshots = ops.providerSnapshots || [];
   return `<div class="grid two-col">
     <div>
+      ${playerSyncServicePanel(service, plan)}
       <form class="settings-form" data-form="provider-settings">
         <div class="settings-grid">
           ${field("refreshCadenceMinutes", "Provider Sync Minutes", settings.refreshCadenceMinutes || 120, "number")}
           ${field("scoringRefreshCadenceMinutes", "Scoring Refresh Minutes", settings.scoringRefreshCadenceMinutes || 15, "number")}
+          ${field("playerSyncIntervalSeconds", "Player Sync Seconds", settings.playerSyncIntervalSeconds || 13, "number")}
+          ${checkbox("smartPlayerSync", "Smart Game-Day Sync", settings.smartPlayerSync !== false)}
+          ${checkbox("syncScoringDuringGames", "Sync Scores During Games", settings.syncScoringDuringGames !== false)}
           ${checkbox("cacheSnapshots", "Cache Provider Snapshots", settings.cacheSnapshots !== false)}
           ${checkbox("manualImportAllowed", "Allow Manual Stat Imports", settings.manualImportAllowed !== false)}
+          ${checkbox("providerDemoMode", "Provider Demo Mode", state.data.meta.providerDemoMode === true)}
+          <label><span>Demo Scenario</span><select name="providerDemoScenario"><option value="unavailable" ${state.data.meta.providerDemoScenario === "unavailable" ? "selected" : ""}>Unavailable</option><option value="delayed" ${state.data.meta.providerDemoScenario === "delayed" ? "selected" : ""}>Delayed Stats</option><option value="missing_players" ${state.data.meta.providerDemoScenario === "missing_players" ? "selected" : ""}>Missing Players</option></select></label>
         </div>
         <button>Save Provider Settings</button>
       </form>
@@ -1403,6 +1758,91 @@ function providerOpsPanel(ops = {}) {
   </div>`;
 }
 
+function playerSyncServicePanel(service = {}, plan = {}) {
+  const enabled = service.enabled === true;
+  const actions = plan.actions?.length ? plan.actions.map(labelize).join(", ") : "Nothing due right now";
+  const next = service.nextRunAt ? new Date(service.nextRunAt).toLocaleTimeString() : "-";
+  return `<div class="sync-switch-panel ${enabled ? "on" : "off"}">
+    <div class="between">
+      <div>
+        <h3>Big Player Sync Switch</h3>
+        <p class="small">${plan.schedule?.detail || "Smart schedule analysis is waiting for provider games."}</p>
+      </div>
+      <button class="giant-switch ${enabled ? "on" : ""}" data-action="${enabled ? "player-sync-stop" : "player-sync-start"}" aria-pressed="${enabled}" aria-label="${enabled ? "Stop smart player sync" : "Start smart player sync"}">
+        <span></span>
+        <strong>${enabled ? "ON" : "OFF"}</strong>
+      </button>
+    </div>
+    <div class="job-grid section-gap-sm">
+      <div class="health-tile"><strong>Mode</strong><span>${labelize(plan.schedule?.mode || "unknown")}</span><p class="small">${plan.schedule?.games || 0} game(s) tracked</p></div>
+      <div class="health-tile"><strong>Rate Lane</strong><span>${service.intervalSeconds || 13}s</span><p class="small">balldontlie free lane: ${plan.freeRateLimits?.balldontliePerMinute || 5}/min</p></div>
+      <div class="health-tile"><strong>Next Run</strong><span>${next}</span><p class="small">${service.status || "stopped"}</p></div>
+      <div class="health-tile"><strong>Due Now</strong><span>${plan.actions?.length || 0}</span><p class="small">${actions}</p></div>
+    </div>
+    <div class="toolbar section-gap-sm"><button data-action="player-sync-run">Run Smart Step Now</button><span class="small">${service.lastResult?.message || service.lastError || "The switch keeps its place across restarts."}</span></div>
+  </div>`;
+}
+
+function setPlayerSyncUi(enabled) {
+  state.data.ops.playerSyncService = {
+    ...(state.data.ops.playerSyncService || {}),
+    enabled,
+    status: enabled ? "starting" : "stopped",
+    nextRunAt: enabled ? new Date().toISOString() : null
+  };
+  state.data.ops.playerSyncPlan = {
+    ...(state.data.ops.playerSyncPlan || {}),
+    enabled,
+    actions: enabled ? (state.data.ops.playerSyncPlan?.actions || ["balldontlie-catalog-page"]) : []
+  };
+  render();
+}
+
+const networkActions = new Set([
+  "sync", "mark-activity-read", "chat-react", "announcement-unpin", "generate-schedule", "generate-playoffs", "setup-family",
+  "run-backup", "dry-run-phase", "dry-run-playoffs", "dry-run-import", "dry-run-correction", "repair-orphans", "merge-duplicate",
+  "provider-snapshot", "player-sync-start", "player-sync-stop", "player-sync-run", "provider-map", "restore-backup", "revoke-sessions",
+  "password-reset-token", "draft-recover", "draft-start", "draft-test", "draft-simulate", "draft-reset", "draft-pause", "draft-autopick",
+  "draft-undo", "draft-skip", "draft-pick", "draft-queue-add", "draft-queue-remove", "draft-keeper-remove", "ingest-stats",
+  "ingest-projections", "process-week", "finalize-week", "process-waivers", "waiver-cancel", "waiver-move", "validate-rosters",
+  "save-lineup", "add-player", "trade-block-add", "trade-block-remove", "trade-accept", "trade-decline", "trade-cancel", "trade-approve",
+  "trade-veto", "expire-trades"
+]);
+
+function setActionBusy(button, action, busy) {
+  if (!button || !networkActions.has(action)) return;
+  button.disabled = busy;
+  button.classList.toggle("is-busy", busy);
+  button.setAttribute("aria-busy", busy ? "true" : "false");
+  state.pendingAction = busy ? action : "";
+  if (busy) setToast(`${labelize(action)} running...`, "info");
+}
+
+function openDialog(dialog) {
+  return new Promise((resolve) => {
+    state.dialog = dialog;
+    state.dialogResolve = resolve;
+    render();
+  });
+}
+
+function confirmAction(message, title = "Confirm Action") {
+  return openDialog({ kind: "confirm", title, message, confirmLabel: "Continue" });
+}
+
+function textAction({ title, message, label, defaultValue = "", confirmLabel = "Save" }) {
+  return openDialog({ kind: "text", title, message, label, defaultValue, confirmLabel });
+}
+
+function ruleValidationPreview() {
+  const league = state.data.league;
+  const issues = [];
+  if ((league.roster?.starters || []).length > Number(league.settings?.maxRosterSize || 0)) issues.push("Max roster size is smaller than starting slots.");
+  if (league.waiver?.mode === "faab" && Number(league.waiver?.budget || 0) <= 0) issues.push("FAAB needs a positive budget.");
+  if (Number(league.playoffs?.teams || 0) < 2) issues.push("Playoff teams must be at least two.");
+  return `<div class="empty empty-left section-gap-sm ${issues.length ? "" : "ok"}">${issues.length ? issues.map((item) => `<p>${item}</p>`).join("") : "<p>Current league-rule values pass local validation.</p>"}</div>`;
+}
+
 function field(name, label, value, type = "text", step = "1") {
   return `<label><span>${label}</span><input name="${name}" type="${type}" step="${step}" value="${value ?? ""}"></label>`;
 }
@@ -1415,12 +1855,21 @@ function notificationCheckbox(category, label) {
   return checkbox(`notify_${category}`, label, state.data.notificationPreferences?.categories?.[category] !== false);
 }
 
+function digestPreviewPanel() {
+  const digest = state.data.notificationDigest || {};
+  return `<div class="backup-panel section-gap-sm"><div class="between"><strong>Digest Preview</strong><span class="pill">${digest.enabled ? "Ready" : "Local only"}</span></div><div class="waiver-list">${(digest.items || []).slice(0, 5).map((item) => `<div class="waiver-item"><p class="small">${item.title} · ${labelize(item.category)}</p></div>`).join("") || `<div class="empty">No digest items yet.</div>`}</div></div>`;
+}
+
 function labelize(value) {
   return value.replace(/_/g, " ").replace(/([A-Z])/g, " $1").replace(/^./, (letter) => letter.toUpperCase());
 }
 
 function chatBox(withForm = false) {
-  return `<div class="chat-list">${state.data.chat.slice(-5).map((item) => `<div class="chat-item"><span class="avatar">${initials(item.author)}</span><div><strong>${item.author}</strong><p class="small">${item.body}</p></div></div>`).join("")}</div>${withForm ? `<form class="toolbar section-gap-sm" data-form="chat"><input name="body" placeholder="Type a message..."><button class="icon" aria-label="Send chat message">▷</button></form>` : ""}`;
+  return `<div class="chat-list">${state.data.chat.slice(-5).map((item) => {
+    const reactions = state.data.chatReactions?.[item.id] || {};
+    const count = Object.values(reactions).reduce((sum, users) => sum + users.length, 0);
+    return `<div class="chat-item"><span class="avatar">${initials(item.author)}</span><div><strong>${item.author}</strong><p class="small">${item.body}</p><button class="ghost" data-action="chat-react" data-chat="${item.id}">+1 ${count || ""}</button></div></div>`;
+  }).join("")}</div>${withForm ? `<form class="toolbar section-gap-sm" data-form="chat"><input name="body" placeholder="Message or @mention"><button class="icon" aria-label="Send chat message">▷</button></form>` : ""}`;
 }
 
 function login() {
@@ -1488,7 +1937,7 @@ async function renderSessions() {
 }
 
 async function refresh() {
-  state.data = await api("/api/bootstrap");
+  setData(await api("/api/bootstrap"));
   state.user = state.data.currentUser || state.user;
   render();
 }
@@ -1561,7 +2010,8 @@ app.addEventListener("click", async (event) => {
       "finalize-week": "Finalize this week and update standings? Create a backup first if scores are still being checked.",
       "generate-playoffs": "Generate the playoff bracket? Create a backup first if standings may still change."
     };
-    if (destructiveConfirmations[action] && !confirm(destructiveConfirmations[action])) return;
+    if (destructiveConfirmations[action] && !await confirmAction(destructiveConfirmations[action])) return;
+    setActionBusy(actionButton, action, true);
     if (action === "view-player") {
       event.preventDefault();
       navigate("player", { playerId: actionButton.dataset.player });
@@ -1597,6 +2047,32 @@ app.addEventListener("click", async (event) => {
       navigate("league", { tab: actionButton.dataset.tab || "standings" });
       return;
     }
+    if (action === "admin-tab") {
+      event.preventDefault();
+      state.adminTab = actionButton.dataset.tab || "overview";
+      navigate("admin", { tab: state.adminTab });
+      return;
+    }
+    if (action === "launch-jump") {
+      event.preventDefault();
+      const view = actionButton.dataset.viewTarget || "admin";
+      const tab = actionButton.dataset.tabTarget || "";
+      if (view === "admin" && tab) state.adminTab = tab;
+      navigate(view, tab ? { tab } : {});
+      const linkedAction = actionButton.dataset.linkedAction;
+      if (linkedAction) setToast(`${labelize(linkedAction)} is available on this screen.`, "info");
+      return;
+    }
+    if (action === "dialog-cancel" || action === "dialog-confirm") {
+      const dialog = state.dialog;
+      const resolve = state.dialogResolve;
+      const value = action === "dialog-confirm" ? (dialog?.kind === "text" ? document.querySelector("[data-dialog-input]")?.value || "" : true) : null;
+      state.dialog = null;
+      state.dialogResolve = null;
+      render();
+      resolve?.(value);
+      return;
+    }
     if (action === "players-page") {
       event.preventDefault();
       navigate("players", { page: Number(actionButton.dataset.page || 1) });
@@ -1611,6 +2087,16 @@ app.addEventListener("click", async (event) => {
     if (action === "mark-activity-read") {
       await api("/api/activity/read", { method: "POST", body: JSON.stringify({ all: true }) });
       await refresh();
+    }
+    if (action === "chat-react") {
+      await api(`/api/chat/${actionButton.dataset.chat}/react`, { method: "POST", body: JSON.stringify({ reaction: "+1" }) });
+      await refresh();
+      return;
+    }
+    if (action === "announcement-unpin") {
+      await api(`/api/admin/announcements/${actionButton.dataset.announcement}`, { method: "DELETE" });
+      await refresh();
+      return;
     }
     if (action === "generate-schedule") {
       await api("/api/admin/schedule/generate", { method: "POST", body: JSON.stringify({ weeks: 14, startWeek: 1 }) });
@@ -1664,7 +2150,7 @@ app.addEventListener("click", async (event) => {
       return;
     }
     if (action === "merge-duplicate") {
-      if (!confirm(`Merge ${actionButton.dataset.source} into ${actionButton.dataset.target}?`)) return;
+      if (!await confirmAction(`Merge ${actionButton.dataset.source} into ${actionButton.dataset.target}?`)) return;
       await api("/api/admin/data-quality/merge-player", { method: "POST", body: JSON.stringify({ sourceId: actionButton.dataset.source, targetId: actionButton.dataset.target }) });
       await refresh();
       return;
@@ -1674,13 +2160,35 @@ app.addEventListener("click", async (event) => {
       await refresh();
       return;
     }
+    if (action === "player-sync-start") {
+      setPlayerSyncUi(true);
+      await api("/api/admin/provider/player-sync/start", { method: "POST" });
+      await refresh();
+      return;
+    }
+    if (action === "player-sync-stop") {
+      setPlayerSyncUi(false);
+      await api("/api/admin/provider/player-sync/stop", { method: "POST" });
+      await refresh();
+      return;
+    }
+    if (action === "player-sync-run") {
+      await api("/api/admin/provider/player-sync/run", { method: "POST" });
+      await refresh();
+      return;
+    }
     if (action === "provider-map") {
       await api("/api/admin/provider/map", { method: "POST", body: JSON.stringify({ providerId: actionButton.dataset.provider, playerId: actionButton.dataset.player }) });
       await refresh();
       return;
     }
+    if (action === "rehearsal-run") {
+      await api("/api/admin/rehearsal/run", { method: "POST" });
+      await refresh();
+      return;
+    }
     if (action === "restore-backup") {
-      if (!confirm(`Restore ${actionButton.dataset.file}? A pre-restore backup will be created first.`)) return;
+      if (!await confirmAction(`Restore ${actionButton.dataset.file}? A pre-restore backup will be created first.`)) return;
       await api("/api/admin/restore", { method: "POST", body: JSON.stringify({ file: actionButton.dataset.file }) });
       state.systemHealth = null;
       await refresh();
@@ -1711,6 +2219,16 @@ app.addEventListener("click", async (event) => {
       render();
       return;
     }
+    if (action === "draft-tv-toggle") {
+      state.draftTvMode = !state.draftTvMode;
+      render();
+      return;
+    }
+    if (action === "draft-recover") {
+      await api("/api/admin/draft/recover", { method: "POST" });
+      await refresh();
+      return;
+    }
     if (action === "draft-start") {
       await api("/api/admin/draft/start", { method: "POST", body: JSON.stringify({ rounds: state.data.league.draft.rounds || 15, resetRosters: true }) });
       await refresh();
@@ -1718,6 +2236,11 @@ app.addEventListener("click", async (event) => {
     if (action === "draft-test") {
       await api("/api/admin/draft/test", { method: "POST", body: JSON.stringify({ rounds: 15 }) });
       await refresh();
+    }
+    if (action === "draft-simulate") {
+      state.draftSimulation = await api("/api/admin/draft/simulate", { method: "POST", body: JSON.stringify({ rounds: state.data.league.draft.rounds || 15, strategy: "balanced" }) });
+      render();
+      return;
     }
     if (action === "draft-reset") {
       await api("/api/admin/draft/reset", { method: "POST" });
@@ -1733,6 +2256,10 @@ app.addEventListener("click", async (event) => {
     }
     if (action === "draft-undo") {
       await api("/api/admin/draft/undo", { method: "POST" });
+      await refresh();
+    }
+    if (action === "draft-skip") {
+      await api("/api/admin/draft/skip", { method: "POST", body: JSON.stringify({ note: "Skipped from draft room" }) });
       await refresh();
     }
     if (action === "draft-pick") {
@@ -1851,7 +2378,8 @@ app.addEventListener("click", async (event) => {
       return;
     }
     if (action === "trade-block-add") {
-      const note = prompt("Trade block note", "Open to offers") || "";
+      const note = await textAction({ title: "Trade Block Note", message: "Add a short note managers will see with this trade-block player.", label: "Note", defaultValue: "Open to offers" });
+      if (note === null) return;
       await api("/api/trade-block", { method: "POST", body: JSON.stringify({ teamId: actionButton.dataset.team || myTeam().id, playerId: actionButton.dataset.player, note }) });
       await refresh();
       return;
@@ -1884,6 +2412,8 @@ app.addEventListener("click", async (event) => {
   } catch (error) {
     setToast(error.message, "error");
     render();
+  } finally {
+    setActionBusy(actionButton, action, false);
   }
 });
 
@@ -1914,7 +2444,7 @@ app.addEventListener("submit", async (event) => {
     if (kind === "login") {
       const result = await api("/api/login", { method: "POST", body: JSON.stringify(values) });
       state.user = result.user;
-      state.data = await api("/api/bootstrap");
+      setData(await api("/api/bootstrap"));
       if (!window.location.hash) navigate("dashboard", {}, true);
       else applyRouteFromLocation();
     }
@@ -1926,6 +2456,7 @@ app.addEventListener("submit", async (event) => {
       return;
     }
     if (kind === "chat") await api("/api/chat", { method: "POST", body: JSON.stringify(values) });
+    if (kind === "announcement") await api("/api/admin/announcements", { method: "POST", body: JSON.stringify(values) });
     if (kind === "add-user") await api("/api/admin/users", { method: "POST", body: JSON.stringify(values) });
     if (kind === "password") await api(`/api/admin/users/${form.dataset.user}/password`, { method: "PUT", body: JSON.stringify(values) });
     if (kind === "profile") await api("/api/profile", { method: "PUT", body: JSON.stringify(values) });
@@ -1934,6 +2465,8 @@ app.addEventListener("submit", async (event) => {
     if (kind === "season-phase") await api("/api/admin/season/phase", { method: "PUT", body: JSON.stringify(values) });
     if (kind === "draft-config") await api("/api/admin/draft/config", { method: "PUT", body: JSON.stringify(draftConfigPayload(form)) });
     if (kind === "draft-keeper") await api("/api/admin/draft/keepers", { method: "POST", body: JSON.stringify(values) });
+    if (kind === "draft-replace-pick") await api("/api/admin/draft/replace-pick", { method: "POST", body: JSON.stringify(values) });
+    if (kind === "draft-swap-picks") await api("/api/admin/draft/swap-picks", { method: "POST", body: JSON.stringify(values) });
     if (kind === "draft-chat") await api("/api/draft/chat", { method: "POST", body: JSON.stringify(values) });
     if (kind === "correction") await api("/api/admin/scoring/corrections", { method: "POST", body: JSON.stringify({ ...values, season: state.data.meta.season, week: state.data.meta.currentWeek }) });
     if (kind === "waiver-claim") await api("/api/waivers", { method: "POST", body: JSON.stringify(values) });
@@ -1953,7 +2486,7 @@ app.addEventListener("submit", async (event) => {
     }
     if (kind === "notifications") await api("/api/notifications/preferences", { method: "PUT", body: JSON.stringify(notificationPayload(form)) });
     if (kind === "csv-import") await api("/api/admin/import/rosters", { method: "POST", body: JSON.stringify(values) });
-    if (kind === "provider-settings") await api("/api/admin/provider/settings", { method: "PUT", body: JSON.stringify({ ...values, cacheSnapshots: values.cacheSnapshots === "on", manualImportAllowed: values.manualImportAllowed === "on" }) });
+    if (kind === "provider-settings") await api("/api/admin/provider/settings", { method: "PUT", body: JSON.stringify({ ...values, cacheSnapshots: values.cacheSnapshots === "on", manualImportAllowed: values.manualImportAllowed === "on", smartPlayerSync: values.smartPlayerSync === "on", syncScoringDuringGames: values.syncScoringDuringGames === "on", providerDemoMode: values.providerDemoMode === "on" }) });
     if (kind === "manual-stats") await api("/api/admin/scoring/manual-import", { method: "POST", body: JSON.stringify(values) });
     if (kind === "league") await api("/api/admin/league", { method: "PUT", body: JSON.stringify(leaguePayload(form)) });
     state.error = "";
@@ -2031,15 +2564,18 @@ function leaguePayload(form) {
     roster: {
       starters: values.starters.split(",").map((slot) => slot.trim()).filter(Boolean),
       bench: number("bench"),
-      ir: number("ir")
+      ir: number("ir"),
+      template: values.rosterTemplate,
+      positionEligibility: values.positionEligibility
     },
     waiver: {
       type: values.waiverType,
       periodDays: number("waiverPeriodDays"),
       weekly: values.weeklyWaivers,
-      mode: values.waiverType?.toLowerCase().includes("rolling") ? "rolling" : "custom",
+      mode: values.waiverMode || (values.waiverType?.toLowerCase().includes("rolling") ? "rolling" : "custom"),
       processDay: values.weeklyWaivers,
-      budget: 0,
+      budget: number("waiverBudget"),
+      freeAgentWindows: values.freeAgentWindows,
       allowFreeAgentAdds: checked("allowFreeAgentAdds"),
       allowWaiverAdds: checked("allowWaiverAdds"),
       allowInjuredToIR: checked("allowInjuredToIR")
@@ -2047,6 +2583,8 @@ function leaguePayload(form) {
     trade: {
       review: values.tradeReview,
       rejectionDays: number("tradeRejectionDays"),
+      deadline: values.tradeDeadline,
+      playoffRosterLock: values.playoffRosterLock,
       allowDraftPickTrades: checked("allowDraftPickTrades")
     },
     draft: {
@@ -2057,6 +2595,7 @@ function leaguePayload(form) {
       teams: number("playoffTeams"),
       weeks: values.playoffWeeks,
       consolationTeams: number("consolationTeams"),
+      format: values.playoffFormat,
       reseeding: checked("playoffReseeding"),
       lockEliminatedTeams: checked("lockEliminatedTeams")
     },

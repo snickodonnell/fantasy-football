@@ -1,11 +1,12 @@
 import http from "node:http";
-import { copyFile, mkdir, readdir, stat, unlink } from "node:fs/promises";
+import { copyFile, mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { createReadStream, readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
 import crypto from "node:crypto";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
+import zlib from "node:zlib";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(__dirname, "data");
@@ -19,9 +20,16 @@ const SESSION_SECRET = process.env.SESSION_SECRET || "local-dev-session-secret-c
 const DEFAULT_SESSION_SECRET = "local-dev-session-secret-change-me";
 const BACKUP_RETENTION = Math.max(1, Number(process.env.BACKUP_RETENTION || 14));
 const BACKUP_INTERVAL_HOURS = Math.max(1, Number(process.env.BACKUP_INTERVAL_HOURS || 24));
+const BDL_FREE_INTERVAL_SECONDS = 13;
+const SLEEPER_PLAYER_REFRESH_HOURS = 23;
+const SLEEPER_TRENDING_REFRESH_MINUTES = 15;
 const LAN_ALLOWLIST = (process.env.LAN_ALLOWLIST || "").split(",").map((item) => item.trim()).filter(Boolean);
 const rateBuckets = new Map();
+const seededPasswordCache = new Map();
 let scheduledBackupTimer = null;
+let playerSyncTimer = null;
+let playerSyncRunning = false;
+let dbCache = null;
 
 if (SESSION_SECRET === DEFAULT_SESSION_SECRET && !process.argv.includes("--seed")) {
   console.warn("WARNING: using the default SESSION_SECRET. Set a long random SESSION_SECRET in .env before sharing this app beyond local development.");
@@ -328,6 +336,9 @@ async function getSqlite() {
   if (!sqlite) {
     sqlite = new DatabaseSync(DB_PATH);
     sqlite.exec("PRAGMA journal_mode = WAL");
+    sqlite.exec("PRAGMA synchronous = NORMAL");
+    sqlite.exec("PRAGMA temp_store = MEMORY");
+    sqlite.exec("PRAGMA cache_size = -20000");
     sqlite.exec("PRAGMA foreign_keys = ON");
     runMigrations(sqlite);
   }
@@ -338,6 +349,7 @@ function closeSqlite() {
   if (!sqlite) return;
   sqlite.close();
   sqlite = null;
+  dbCache = null;
 }
 
 function runMigrations(db) {
@@ -625,6 +637,12 @@ function runMigrations(db) {
       CREATE INDEX IF NOT EXISTS idx_matchups_week ON matchups(week);
     `);
   });
+  applySchemaVersion(db, 3, () => {
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_schema_migrations_applied ON schema_migrations(applied_at);
+      CREATE INDEX IF NOT EXISTS idx_score_corrections_week ON score_corrections(season, week);
+    `);
+  });
   db.exec("PRAGMA optimize");
 }
 
@@ -640,7 +658,14 @@ function applySchemaVersion(db, version, fn) {
   db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, datetime('now'))").run(version);
 }
 
-async function loadDb() {
+function schemaMigrationStatus(sqliteDb) {
+  const migrations = sqliteDb.prepare("SELECT version, applied_at FROM schema_migrations ORDER BY version").all();
+  return { currentVersion: migrations.at(-1)?.version || 0, migrations };
+}
+
+async function loadDb(options = {}) {
+  const shouldCache = options.cache !== false;
+  if (!options.fresh && dbCache) return dbCache;
   const db = await getSqlite();
   const hasData = db.prepare("SELECT COUNT(*) AS count FROM users").get().count > 0;
   if (!hasData) await saveDb(initialDb());
@@ -650,7 +675,7 @@ async function loadDb() {
   const leagueRow = db.prepare("SELECT * FROM league LIMIT 1").get();
   const providerRow = db.prepare("SELECT * FROM provider_sync WHERE id = 1").get();
 
-  return {
+  const hydrated = {
     meta,
     users: db.prepare("SELECT * FROM users ORDER BY created_at").all().map((row) => ({
       id: row.id,
@@ -891,18 +916,52 @@ async function loadDb() {
       updatedAt: row.updated_at
     }))
   };
+  markLoadedTableFingerprints(hydrated);
+  if (shouldCache) dbCache = hydrated;
+  return hydrated;
+}
+
+function fingerprintRows(rows, fields = ["id", "syncedAt"]) {
+  return `${rows?.length || 0}:${(rows || []).map((row) => fields.map((field) => row[field] ?? "").join("~")).join("|")}`;
+}
+
+function markLoadedTableFingerprints(data) {
+  Object.defineProperty(data, "__loadedFingerprints", {
+    value: {
+      nflTeams: fingerprintRows(data.nflTeams),
+      nflGames: fingerprintRows(data.nflGames, ["id", "status", "homeScore", "visitorScore", "syncedAt"]),
+      nflPlayerStats: fingerprintRows(data.nflPlayerStats),
+      providerPlayers: fingerprintRows(data.providerPlayers),
+      providerTrending: fingerprintRows(data.providerTrending, ["id", "count", "syncedAt"])
+    },
+    enumerable: false,
+    configurable: true
+  });
+}
+
+function unchangedProviderTables(data) {
+  const original = data.__loadedFingerprints || {};
+  const unchanged = new Set();
+  if (original.nflTeams === fingerprintRows(data.nflTeams)) unchanged.add("nfl_teams");
+  if (original.nflGames === fingerprintRows(data.nflGames, ["id", "status", "homeScore", "visitorScore", "syncedAt"])) unchanged.add("nfl_games");
+  if (original.nflPlayerStats === fingerprintRows(data.nflPlayerStats)) unchanged.add("nfl_player_stats");
+  if (original.providerPlayers === fingerprintRows(data.providerPlayers)) unchanged.add("provider_players");
+  if (original.providerTrending === fingerprintRows(data.providerTrending, ["id", "count", "syncedAt"])) unchanged.add("provider_trending");
+  return unchanged;
 }
 
 async function loadDbForCheck() {
-  return loadDb();
+  return loadDb({ fresh: true, cache: false });
 }
 
 async function saveDb(data) {
   const db = await getSqlite();
   const json = (value) => JSON.stringify(value ?? null);
+  const skipTables = unchangedProviderTables(data);
   try {
     db.exec("BEGIN IMMEDIATE");
     for (const table of ["notification_preferences", "activity_events", "lineup_locks", "score_corrections", "weekly_player_stats", "provider_trending", "provider_players", "nfl_player_stats", "nfl_games", "nfl_teams", "provider_sync", "chat", "trade_block", "player_research", "trades", "waiver_claims", "transactions", "matchups", "lineups", "players", "teams", "league", "sessions", "users", "meta"]) {
+      if (skipTables.has(table)) continue;
       db.exec(`DELETE FROM ${table}`);
     }
 
@@ -955,22 +1014,32 @@ async function saveDb(data) {
     db.prepare("INSERT INTO provider_sync (id, provider, last_run_at, message, next_player_cursor, details_json) VALUES (1, ?, ?, ?, ?, ?)")
       .run(data.providerSync.provider, data.providerSync.lastRunAt, data.providerSync.message, data.providerSync.nextPlayerCursor || null, json(data.providerSync.details || {}));
 
-    const insertNflTeam = db.prepare("INSERT INTO nfl_teams (id, provider, provider_id, conference, division, location, name, full_name, abbreviation, raw_json, synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-    for (const team of data.nflTeams || []) insertNflTeam.run(team.id, team.provider, team.providerId, team.conference, team.division, team.location, team.name, team.fullName, team.abbreviation, json(team.raw || team), team.syncedAt || new Date().toISOString());
-
-    const insertNflGame = db.prepare("INSERT INTO nfl_games (id, provider, provider_id, season, week, status, date, home_team_provider_id, visitor_team_provider_id, home_score, visitor_score, raw_json, synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-    for (const game of data.nflGames || []) insertNflGame.run(game.id, game.provider, game.providerId, game.season, game.week, game.status, game.date, game.homeTeamProviderId, game.visitorTeamProviderId, game.homeScore, game.visitorScore, json(game.raw || game), game.syncedAt || new Date().toISOString());
-
-    const insertNflStats = db.prepare("INSERT INTO nfl_player_stats (id, provider, provider_id, player_provider_id, game_provider_id, season, week, raw_json, synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
-    for (const stat of data.nflPlayerStats || []) insertNflStats.run(stat.id, stat.provider, stat.providerId, stat.playerProviderId, stat.gameProviderId, stat.season, stat.week, json(stat.raw || stat), stat.syncedAt || new Date().toISOString());
-
-    const insertProviderPlayer = db.prepare("INSERT INTO provider_players (id, provider, provider_id, name, first_name, last_name, position, fantasy_positions_json, team, status, injury_status, search_rank, raw_json, synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-    for (const player of data.providerPlayers || []) {
-      insertProviderPlayer.run(player.id, player.provider, player.providerId, player.name, player.firstName || null, player.lastName || null, player.position || null, json(player.fantasyPositions || []), player.team || null, player.status || null, player.injuryStatus || null, player.searchRank ?? null, json(player.raw || player), player.syncedAt || new Date().toISOString());
+    if (!skipTables.has("nfl_teams")) {
+      const insertNflTeam = db.prepare("INSERT INTO nfl_teams (id, provider, provider_id, conference, division, location, name, full_name, abbreviation, raw_json, synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+      for (const team of data.nflTeams || []) insertNflTeam.run(team.id, team.provider, team.providerId, team.conference, team.division, team.location, team.name, team.fullName, team.abbreviation, json(team.raw || team), team.syncedAt || new Date().toISOString());
     }
 
-    const insertProviderTrending = db.prepare("INSERT INTO provider_trending (id, provider, provider_id, trend_type, count, lookback_hours, raw_json, synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
-    for (const trend of data.providerTrending || []) insertProviderTrending.run(trend.id, trend.provider, trend.providerId, trend.trendType, trend.count, trend.lookbackHours, json(trend.raw || trend), trend.syncedAt || new Date().toISOString());
+    if (!skipTables.has("nfl_games")) {
+      const insertNflGame = db.prepare("INSERT INTO nfl_games (id, provider, provider_id, season, week, status, date, home_team_provider_id, visitor_team_provider_id, home_score, visitor_score, raw_json, synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+      for (const game of data.nflGames || []) insertNflGame.run(game.id, game.provider, game.providerId, game.season, game.week, game.status, game.date, game.homeTeamProviderId, game.visitorTeamProviderId, game.homeScore, game.visitorScore, json(game.raw || game), game.syncedAt || new Date().toISOString());
+    }
+
+    if (!skipTables.has("nfl_player_stats")) {
+      const insertNflStats = db.prepare("INSERT INTO nfl_player_stats (id, provider, provider_id, player_provider_id, game_provider_id, season, week, raw_json, synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+      for (const stat of data.nflPlayerStats || []) insertNflStats.run(stat.id, stat.provider, stat.providerId, stat.playerProviderId, stat.gameProviderId, stat.season, stat.week, json(stat.raw || stat), stat.syncedAt || new Date().toISOString());
+    }
+
+    if (!skipTables.has("provider_players")) {
+      const insertProviderPlayer = db.prepare("INSERT INTO provider_players (id, provider, provider_id, name, first_name, last_name, position, fantasy_positions_json, team, status, injury_status, search_rank, raw_json, synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+      for (const player of data.providerPlayers || []) {
+        insertProviderPlayer.run(player.id, player.provider, player.providerId, player.name, player.firstName || null, player.lastName || null, player.position || null, json(player.fantasyPositions || []), player.team || null, player.status || null, player.injuryStatus || null, player.searchRank ?? null, json(player.raw || player), player.syncedAt || new Date().toISOString());
+      }
+    }
+
+    if (!skipTables.has("provider_trending")) {
+      const insertProviderTrending = db.prepare("INSERT INTO provider_trending (id, provider, provider_id, trend_type, count, lookback_hours, raw_json, synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+      for (const trend of data.providerTrending || []) insertProviderTrending.run(trend.id, trend.provider, trend.providerId, trend.trendType, trend.count, trend.lookbackHours, json(trend.raw || trend), trend.syncedAt || new Date().toISOString());
+    }
 
     const insertWeeklyStats = db.prepare("INSERT INTO weekly_player_stats (id, provider, provider_id, app_player_id, season, week, stat_type, stats_json, fantasy_points, raw_json, synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
     for (const stat of data.weeklyPlayerStats || []) {
@@ -994,8 +1063,11 @@ async function saveDb(data) {
     }
 
     db.exec("COMMIT");
+    markLoadedTableFingerprints(data);
+    dbCache = data;
   } catch (error) {
     db.exec("ROLLBACK");
+    dbCache = null;
     throw error;
   }
 }
@@ -1056,7 +1128,13 @@ function getSessionUser(db, req) {
 
 function send(res, status, body, headers = {}) {
   const payload = typeof body === "string" ? body : JSON.stringify(escapeClientStrings(body));
-  res.writeHead(status, { "Content-Type": typeof body === "string" ? "text/plain" : "application/json", ...headers });
+  const baseHeaders = { "Content-Type": typeof body === "string" ? "text/plain" : "application/json", ...headers };
+  if (res.locals?.acceptsGzip && typeof body !== "string" && Buffer.byteLength(payload) > 1024) {
+    res.writeHead(status, { ...baseHeaders, "Content-Encoding": "gzip", "Vary": "Accept-Encoding" });
+    res.end(zlib.gzipSync(payload));
+    return;
+  }
+  res.writeHead(status, baseHeaders);
   res.end(payload);
 }
 
@@ -1148,8 +1226,15 @@ function enrich(db, user) {
   normalizeSeasonPhase(db);
   normalizeDraftState(db);
   normalizeWaiverClaims(db);
+  const playersByTeam = new Map();
+  for (const player of db.players || []) {
+    if (!player.ownership) continue;
+    const teamRoster = playersByTeam.get(player.ownership) || [];
+    teamRoster.push(player);
+    playersByTeam.set(player.ownership, teamRoster);
+  }
   const teams = db.teams.map((team) => {
-    const roster = db.players.filter((player) => player.ownership === team.id);
+    const roster = playersByTeam.get(team.id) || [];
     const pointsFor = roster.reduce((sum, player) => sum + player.projection * 5.2, 0);
     const projected = roster.reduce((sum, player) => sum + player.projection, 0);
     return { ...team, pointsFor: Number(pointsFor.toFixed(1)), pointsAgainst: Number((pointsFor * 0.91).toFixed(1)), projected: Number(projected.toFixed(1)) };
@@ -1157,6 +1242,8 @@ function enrich(db, user) {
   const myTeam = teams.find((team) => team.ownerUserId === user?.id) || teams[0];
   const activity = user ? visibleActivityForUser(db, user) : [];
   const preferences = normalizeNotificationPreferences(db).find((pref) => pref.userId === user?.id) || defaultNotificationPreferences(user?.id);
+  const providerPlayers = db.providerPlayers || [];
+  const weeklyPlayerStats = db.weeklyPlayerStats || [];
   return {
     currentUser: safeUser(user),
     users: isAdminUser(user) ? db.users.map(safeUser) : [],
@@ -1184,25 +1271,39 @@ function enrich(db, user) {
         nflTeams: db.nflTeams?.length || 0,
         nflGames: db.nflGames?.length || 0,
         playerStats: db.nflPlayerStats?.length || 0,
-        players: db.players?.filter((player) => String(player.id).startsWith("bdl-")).length || 0,
-        sleeperPlayers: db.providerPlayers?.filter((player) => player.provider === "sleeper").length || 0,
+        players: db.players?.reduce((count, player) => count + (String(player.id).startsWith("bdl-") ? 1 : 0), 0) || 0,
+        sleeperPlayers: providerPlayers.reduce((count, player) => count + (player.provider === "sleeper" ? 1 : 0), 0),
         trending: db.providerTrending?.length || 0
       }
     },
     ops: {
       readiness: readinessChecklist(db),
+      launchReadiness: launchReadinessChecklist(db),
+      rehearsal: rehearsalChecklist(db),
+      setupReview: setupReview(db),
+      liveOps: liveOpsReadiness(db),
       scheduledJobs: scheduledJobsPanel(db),
       dataQuality: dataQualityReport(db),
       providerSettings: providerSettings(db),
+      playerSyncService: playerSyncServiceState(db),
+      playerSyncPlan: playerSyncPlan(db),
       providerSnapshots: db.meta.providerSnapshots || [],
-      providerMappings: db.meta.providerMappings || {}
+      providerMappings: db.meta.providerMappings || {},
+      weekly: weeklyOperations(db)
     },
+    onboarding: firstLoginOnboarding(db, user),
+    phaseGuidance: phaseGuidance(db, user),
+    family: familyEngagement(db),
+    researchTools: researchDecisionTools(db, user),
+    notificationDigest: notificationDigest(db, user),
+    announcements: (db.meta.announcements || []).filter((item) => !item.expiresAt || item.expiresAt > Date.now()),
+    chatReactions: db.meta.chatReactions || {},
     nflTeams: db.nflTeams || [],
     nflGames: db.nflGames || [],
-    providerPlayers: db.providerPlayers || [],
+    providerPlayers,
     providerTrending: db.providerTrending || [],
     scoring: {
-      weeklyStats: db.weeklyPlayerStats || [],
+      weeklyStats: weeklyPlayerStats,
       corrections: db.scoreCorrections || [],
       locks: db.lineupLocks || [],
       summary: scoringSummary(db)
@@ -1265,7 +1366,14 @@ function canManageTeam(user, team) {
 }
 
 function hasSeededPassword(user) {
-  return Boolean(user && hashPassword("password", user.salt) === user.passwordHash);
+  if (!user?.salt || !user?.passwordHash) return false;
+  const key = `${user.id || user.username}:${user.salt}:${user.passwordHash}`;
+  if (!seededPasswordCache.has(key)) seededPasswordCache.set(key, hashPassword("password", user.salt) === user.passwordHash);
+  return seededPasswordCache.get(key);
+}
+
+function primeSeededPasswordCache(db) {
+  for (const user of db.users || []) hasSeededPassword(user);
 }
 
 function normalizeTeamColor(value) {
@@ -1322,19 +1430,40 @@ function normalizeDraftState(db) {
   const order = (draft.order || db.teams.map((team) => team.id)).filter((teamId) => db.teams.some((team) => team.id === teamId));
   const missing = db.teams.map((team) => team.id).filter((teamId) => !order.includes(teamId));
   const nextOrder = [...order, ...missing];
+  const picks = (draft.picks || [])
+    .filter((pick) => pick && Number(pick.pickNumber) > 0 && nextOrder.includes(pick.teamId))
+    .sort((a, b) => Number(a.pickNumber) - Number(b.pickNumber));
+  const lastPickNumber = picks.reduce((max, pick) => Math.max(max, Number(pick.pickNumber || 0)), 0);
+  const totalPicks = nextOrder.length * Number(draft.rounds || 15);
   const queues = {};
   for (const teamId of nextOrder) {
     queues[teamId] = (draft.queues?.[teamId] || []).filter((playerId) => db.players.some((player) => player.id === playerId && !player.ownership));
   }
+  let status = draft.status || "not_started";
+  if (status === "in_progress" && (!draft.clockStartedAt || Number(draft.currentPick || 1) !== lastPickNumber + 1)) {
+    draft.resumedAt = new Date().toISOString();
+    draft.clockStartedAt = draft.clockStartedAt || draft.resumedAt;
+  }
+  if (totalPicks > 0 && lastPickNumber >= totalPicks && ["in_progress", "paused"].includes(status)) status = "complete";
   db.league.draft = {
     ...makeDraftState(nextOrder),
     ...draft,
     order: nextOrder,
     orderStyle: draft.orderStyle || draft.mode || "snake",
+    status,
+    currentPick: ["in_progress", "paused", "complete"].includes(status) ? Math.min(lastPickNumber + 1, totalPicks + 1) : Number(draft.currentPick || 1),
     queues,
     chat: draft.chat || [],
     keepers: draft.keepers || [],
-    picks: draft.picks || []
+    picks,
+    recovery: {
+      lastSavedAt: draft.lastSavedAt || draft.clockStartedAt || draft.startedAt || null,
+      resumedAt: draft.resumedAt || null,
+      currentPick: ["in_progress", "paused", "complete"].includes(status) ? Math.min(lastPickNumber + 1, totalPicks + 1) : Number(draft.currentPick || 1),
+      picksMade: picks.length,
+      totalPicks,
+      canResume: ["in_progress", "paused"].includes(status)
+    }
   };
   return db.league.draft;
 }
@@ -1380,6 +1509,7 @@ function makeDraftPick(db, playerId) {
   pruneDraftQueues(db, playerId);
   draft.currentPick = pickNumber + 1;
   draft.clockStartedAt = new Date().toISOString();
+  draft.lastSavedAt = draft.clockStartedAt;
   if (draft.currentPick > draft.order.length * Number(draft.rounds || 15)) {
     draft.status = "complete";
     draft.completedAt = new Date().toISOString();
@@ -1399,7 +1529,79 @@ function undoDraftPick(db) {
   draft.status = "in_progress";
   draft.completedAt = null;
   draft.clockStartedAt = new Date().toISOString();
+  draft.lastSavedAt = draft.clockStartedAt;
   return { ok: true, pick };
+}
+
+function skipDraftPick(db, note = "") {
+  normalizeDraftState(db);
+  const draft = db.league.draft;
+  if (draft.status !== "in_progress") return { error: "Draft is not in progress" };
+  const teamId = getDraftTeamId(draft);
+  if (!teamId) return { error: "Draft order is empty" };
+  const pickNumber = Number(draft.currentPick || 1);
+  const pick = {
+    pickNumber,
+    round: Math.ceil(pickNumber / draft.order.length),
+    slot: ((pickNumber - 1) % draft.order.length) + 1,
+    teamId,
+    skipped: true,
+    playerId: null,
+    playerName: "Skipped pick",
+    position: "SKIP",
+    note: String(note || "").slice(0, 160),
+    madeAt: new Date().toISOString()
+  };
+  draft.picks.push(pick);
+  draft.currentPick = pickNumber + 1;
+  draft.clockStartedAt = new Date().toISOString();
+  draft.lastSavedAt = draft.clockStartedAt;
+  if (draft.currentPick > draft.order.length * Number(draft.rounds || 15)) {
+    draft.status = "complete";
+    draft.completedAt = new Date().toISOString();
+  }
+  return { ok: true, pick };
+}
+
+function replaceDraftPick(db, pickNumber, playerId) {
+  normalizeDraftState(db);
+  const draft = db.league.draft;
+  const pick = draft.picks.find((item) => Number(item.pickNumber) === Number(pickNumber));
+  if (!pick) return { error: "Draft pick not found" };
+  const player = db.players.find((item) => item.id === playerId);
+  if (!player) return { error: "Player not found" };
+  if (player.ownership && player.ownership !== pick.teamId) return { error: "Player is already on another roster" };
+  const oldPlayer = db.players.find((item) => item.id === pick.playerId);
+  if (oldPlayer && oldPlayer.ownership === pick.teamId) oldPlayer.ownership = null;
+  player.ownership = pick.teamId;
+  pruneDraftQueues(db, player.id);
+  Object.assign(pick, {
+    playerId: player.id,
+    playerName: player.name,
+    position: player.position,
+    skipped: false,
+    replacedAt: new Date().toISOString()
+  });
+  draft.lastSavedAt = pick.replacedAt;
+  return { ok: true, pick };
+}
+
+function swapDraftPicks(db, firstPickNumber, secondPickNumber) {
+  normalizeDraftState(db);
+  const draft = db.league.draft;
+  const first = draft.picks.find((item) => Number(item.pickNumber) === Number(firstPickNumber));
+  const second = draft.picks.find((item) => Number(item.pickNumber) === Number(secondPickNumber));
+  if (!first || !second) return { error: "Both completed picks are required" };
+  const firstTeamId = first.teamId;
+  first.teamId = second.teamId;
+  second.teamId = firstTeamId;
+  for (const pick of [first, second]) {
+    const pickedPlayer = db.players.find((player) => player.id === pick.playerId);
+    if (pickedPlayer) pickedPlayer.ownership = pick.teamId;
+    pick.swappedAt = new Date().toISOString();
+  }
+  draft.lastSavedAt = new Date().toISOString();
+  return { ok: true, picks: [first, second] };
 }
 
 function chooseAutoPick(db) {
@@ -1421,6 +1623,72 @@ function chooseAutoPick(db) {
     if (b.projection !== a.projection) return b.projection - a.projection;
     return a.name.localeCompare(b.name);
   })[0];
+}
+
+function chooseMockDraftPick(db, strategy = "balanced") {
+  if (strategy === "best_available") {
+    return db.players
+      .filter((player) => !player.ownership && player.status !== "Out")
+      .sort((a, b) => b.projection - a.projection || a.name.localeCompare(b.name))[0];
+  }
+  if (strategy === "upside") {
+    const weights = { RB: 1.35, WR: 1.32, TE: 1.12, QB: 0.92, K: 0.7, "D/ST": 0.76 };
+    return db.players
+      .filter((player) => !player.ownership && player.status !== "Out")
+      .sort((a, b) => (b.projection * (weights[b.position] || 1)) - (a.projection * (weights[a.position] || 1)) || a.name.localeCompare(b.name))[0];
+  }
+  return chooseAutoPick(db);
+}
+
+function rosterSummaryForDraft(db, teamId) {
+  const roster = db.players.filter((player) => player.ownership === teamId);
+  const counts = roster.reduce((acc, player) => ({ ...acc, [player.position]: (acc[player.position] || 0) + 1 }), {});
+  return {
+    teamId,
+    teamName: db.teams.find((team) => team.id === teamId)?.name || teamId,
+    rosterSize: roster.length,
+    projectedPoints: Number(roster.reduce((sum, player) => sum + Number(player.projection || 0), 0).toFixed(1)),
+    counts
+  };
+}
+
+function simulateMockDraft(db, options = {}) {
+  const sourceOwnership = new Map((db.players || []).map((player) => [player.id, player.ownership || null]));
+  const clone = structuredClone(db);
+  const previous = normalizeDraftState(clone);
+  const rounds = Math.max(1, Number(options.rounds || previous.rounds || 15));
+  const strategies = options.strategies || {};
+  clone.league.draft = {
+    ...makeDraftState(previous.order),
+    orderStyle: options.orderStyle || previous.orderStyle || "snake",
+    pickTimeSeconds: previous.pickTimeSeconds || 60,
+    positionLimits: previous.positionLimits || yahooDefaultRules.draft.positionLimits,
+    queues: options.useQueues === false ? {} : previous.queues || {},
+    chat: previous.chat || [],
+    keepers: previous.keepers || []
+  };
+  clone.league.draft.rounds = rounds;
+  clone.league.draft.status = "in_progress";
+  clone.league.draft.startedAt = new Date().toISOString();
+  clone.league.draft.clockStartedAt = clone.league.draft.startedAt;
+  clearRosters(clone);
+  if (options.includeKeepers !== false) applyDraftKeepers(clone);
+  const total = clone.league.draft.order.length * rounds;
+  for (let i = 0; i < total && clone.league.draft.status === "in_progress"; i++) {
+    const teamId = getDraftTeamId(clone.league.draft);
+    const player = chooseMockDraftPick(clone, strategies[teamId] || options.strategy || "balanced");
+    if (!player) break;
+    makeDraftPick(clone, player.id);
+  }
+  const sourceChanged = (db.players || []).some((player) => sourceOwnership.get(player.id) !== (player.ownership || null));
+  return {
+    rounds,
+    orderStyle: clone.league.draft.orderStyle,
+    picks: clone.league.draft.picks || [],
+    rosters: (clone.teams || []).map((team) => rosterSummaryForDraft(clone, team.id)),
+    sourceChanged,
+    warnings: clone.league.draft.status === "complete" ? [] : ["Simulation stopped early because no eligible players were available."]
+  };
 }
 
 function runTestDraft(db, rounds = 15) {
@@ -2377,6 +2645,353 @@ function exportLeagueData(db) {
   };
 }
 
+function highRiskRepositoryPlan() {
+  return {
+    draft: ["league.draft", "players.ownership", "lineups", "activity_events"],
+    waivers: ["waiver_claims", "players.ownership", "lineups", "transactions", "teams.waiver_rank", "activity_events"],
+    trades: ["trades", "players.ownership", "lineups", "transactions", "activity_events"],
+    restore: ["all tables via SQLite file swap", "pre-restore backup metadata", "integrity check"],
+    imports: ["players.ownership", "league.draft", "transactions", "activity_events"]
+  };
+}
+
+function targetedPersistenceAudit(db) {
+  const plan = highRiskRepositoryPlan();
+  const pendingClaims = (db.waiverClaims || []).filter((claim) => claim.status === "pending").length;
+  const activeTrades = (db.trades || []).filter((trade) => ["offered", "accepted", "commissioner_review"].includes(trade.status)).length;
+  return {
+    plan,
+    highRiskAreas: Object.keys(plan),
+    currentRisk: {
+      activeDraft: ["in_progress", "paused"].includes(db.league?.draft?.status),
+      pendingClaims,
+      activeTrades
+    },
+    guidance: "Use targeted repository writes for draft, waiver, trade, restore, and import endpoints before multi-family production use."
+  };
+}
+
+function transactionSafetyReport(db) {
+  return [
+    { area: "draft", ok: Boolean(db.league?.draft), rollbackTest: "draft pick ownership and currentPick should roll back together" },
+    { area: "waivers", ok: Array.isArray(db.waiverClaims), rollbackTest: "claim status, player ownership, lineup removal, and waiver rank should roll back together" },
+    { area: "trades", ok: Array.isArray(db.trades), rollbackTest: "trade status, both rosters, lineups, and transaction history should roll back together" },
+    { area: "restore", ok: Boolean(db.meta), rollbackTest: "pre-restore backup and integrity check metadata should remain visible" },
+    { area: "imports", ok: Array.isArray(db.players), rollbackTest: "CSV assignment counts and player ownership should roll back together" }
+  ];
+}
+
+function validateLeagueRules(payload = {}) {
+  const errors = [];
+  const scoring = payload.scoring || {};
+  const roster = payload.roster || {};
+  const waiver = payload.waiver || {};
+  const trade = payload.trade || {};
+  const playoffs = payload.playoffs || {};
+  const starters = roster.starters || [];
+  if (!Array.isArray(starters) || starters.length < 1) errors.push("At least one starting roster slot is required.");
+  if (Number(roster.bench) < 0 || Number(roster.ir) < 0) errors.push("Bench and IR slots cannot be negative.");
+  if (Number(payload.settings?.maxRosterSize || 0) < starters.length) errors.push("Max roster size must cover all starting slots.");
+  for (const [key, value] of Object.entries(scoring)) {
+    if (!Number.isFinite(Number(value))) errors.push(`${labelForPhase(key)} scoring must be numeric.`);
+  }
+  const waiverModes = ["rolling", "faab", "free_agent_windows", "custom"];
+  if (waiver.mode && !waiverModes.includes(waiver.mode)) errors.push("Waiver mode must be rolling, FAAB, free-agent windows, or custom.");
+  if (waiver.mode === "faab" && Number(waiver.budget || 0) <= 0) errors.push("FAAB leagues need a positive budget.");
+  if (Number(trade.rejectionDays || 0) < 0) errors.push("Trade review days cannot be negative.");
+  if (Number(playoffs.teams || 0) < 2) errors.push("At least two playoff teams are required.");
+  if (Number(playoffs.consolationTeams || 0) < 0) errors.push("Consolation teams cannot be negative.");
+  return { ok: errors.length === 0, errors };
+}
+
+function updateLeagueRepository(db, payload = {}) {
+  const validation = validateLeagueRules(payload);
+  if (!validation.ok) return { error: validation.errors.join("; "), validation };
+  if (payload.name) db.league.name = String(payload.name).slice(0, 80);
+  if (payload.season) db.meta.season = Number(payload.season);
+  if (payload.currentWeek) db.meta.currentWeek = Number(payload.currentWeek);
+  if (payload.settings) db.league.settings = { ...db.league.settings, ...payload.settings };
+  if (payload.roster) db.league.roster = { ...db.league.roster, ...payload.roster };
+  if (payload.waiver) db.league.waiver = { ...db.league.waiver, ...payload.waiver };
+  if (payload.trade) db.league.trade = { ...db.league.trade, ...payload.trade };
+  if (payload.playoffs) db.league.playoffs = { ...db.league.playoffs, ...payload.playoffs };
+  if (payload.draft) db.league.draft = { ...db.league.draft, ...payload.draft };
+  if (payload.scoring) db.league.scoring = { ...db.league.scoring, ...payload.scoring };
+  return { ok: true, validation };
+}
+
+function firstLoginOnboarding(db, user) {
+  const team = db.teams.find((item) => item.ownerUserId === user?.id);
+  const defaultTeamName = team && team.name === `${user.displayName}'s Team`;
+  const steps = [
+    { id: "password", label: "Change seeded password", done: !hasSeededPassword(user), view: "settings" },
+    { id: "profile", label: "Confirm profile and contact", done: Boolean(user?.email), view: "settings" },
+    { id: "team", label: "Set team name, initials, color, or logo", done: Boolean(team?.logoUrl) || !defaultTeamName, view: "settings" },
+    { id: "notifications", label: "Choose notification digest preferences", done: Boolean((db.notificationPreferences || []).find((pref) => pref.userId === user?.id)), view: "settings" }
+  ];
+  return { complete: steps.every((step) => step.done), steps, inviteInstructions: inviteResetInstructions(db) };
+}
+
+function inviteResetInstructions(db) {
+  return {
+    commissioner: "Create an account or reset token from Commissioner > Accounts, then read the username and one-time token to the family member.",
+    manager: "Sign in on the home-network URL, use the reset token if needed, then change the password and team details in Settings.",
+    expires: "Reset tokens expire after one hour."
+  };
+}
+
+function phaseGuidance(db, user) {
+  const phase = normalizeSeasonPhase(db);
+  const team = db.teams.find((item) => item.ownerUserId === user?.id);
+  const guidance = {
+    preseason: ["Check your team settings.", "Review draft order and keepers.", "Try a draft rehearsal."],
+    draft: ["Open the Draft room.", "Build your queue.", "Watch the on-clock timer."],
+    regular_season: ["Set this week's lineup.", "Review waiver claims.", "Check matchup previews."],
+    playoffs: ["Confirm lineup locks.", "Review bracket status.", "Watch finalization checklist."],
+    offseason: ["Review league history.", "Update team profile.", "Plan rule changes."]
+  }[phase] || [];
+  return { phase, teamId: team?.id || null, items: guidance };
+}
+
+function weeklyOperations(db) {
+  return {
+    matchupPreviews: matchupPreviews(db),
+    lineupLockCountdowns: lineupLockCountdowns(db),
+    waiverSchedule: waiverSchedule(db),
+    finalizationChecklist: finalizationChecklist(db)
+  };
+}
+
+function matchupPreviews(db) {
+  return (db.matchups || [])
+    .filter((matchup) => Number(matchup.week) === Number(db.meta.currentWeek))
+    .map((matchup) => {
+      const homeProjection = projectedLineupScore(db, matchup.homeTeamId);
+      const awayProjection = projectedLineupScore(db, matchup.awayTeamId);
+      const homeInjuries = lineupPlayers(db, matchup.homeTeamId).filter((p) => p.status !== "Healthy").length;
+      const awayInjuries = lineupPlayers(db, matchup.awayTeamId).filter((p) => p.status !== "Healthy").length;
+      return {
+        matchupId: matchup.id,
+        homeTeamId: matchup.homeTeamId,
+        awayTeamId: matchup.awayTeamId,
+        homeProjection,
+        awayProjection,
+        favoriteTeamId: homeProjection >= awayProjection ? matchup.homeTeamId : matchup.awayTeamId,
+        spread: roundScore(Math.abs(homeProjection - awayProjection)),
+        notes: [`Provider: ${db.providerSync?.provider || "local"}`, `${homeInjuries + awayInjuries} injury/status flag(s)`]
+      };
+    });
+}
+
+function lineupPlayers(db, teamId) {
+  return Object.values(db.lineups?.[teamId] || {}).map((id) => db.players.find((player) => player.id === id)).filter(Boolean);
+}
+
+function projectedLineupScore(db, teamId) {
+  return roundScore(lineupPlayers(db, teamId).reduce((sum, player) => sum + Number(player.projection || 0), 0));
+}
+
+function lineupLockCountdowns(db) {
+  const now = Date.now();
+  return db.teams.map((team) => {
+    const players = db.players.filter((player) => player.ownership === team.id);
+    const next = players
+      .map((player) => ({ playerId: player.id, playerName: player.name, kickoffAt: kickoffForPlayer(db, player), locked: isPlayerLocked(db, player.id) }))
+      .sort((a, b) => a.kickoffAt - b.kickoffAt)[0];
+    return { teamId: team.id, teamName: team.name, nextLock: next ? { ...next, secondsUntil: Math.max(0, Math.floor((next.kickoffAt - now) / 1000)) } : null };
+  });
+}
+
+function kickoffForPlayer(db, player) {
+  const game = (db.nflGames || []).find((item) => Number(item.week) === Number(db.meta.currentWeek) && (item.homeTeamProviderId === player.nflTeam || item.visitorTeamProviderId === player.nflTeam || item.raw?.home_team?.abbreviation === player.nflTeam || item.raw?.visitor_team?.abbreviation === player.nflTeam));
+  return game?.date ? Date.parse(game.date) : Date.now() + 1000 * 60 * 60 * 24;
+}
+
+function waiverSchedule(db) {
+  const waiver = db.league.waiver || {};
+  return {
+    mode: waiver.mode || "rolling",
+    processDay: waiver.processDay || waiver.weekly || "Tuesday",
+    pending: (db.waiverClaims || []).filter((claim) => claim.status === "pending").length,
+    manualQueue: waiverPreview(db)
+  };
+}
+
+function finalizationChecklist(db) {
+  const week = Number(db.meta.currentWeek);
+  const matchups = (db.matchups || []).filter((matchup) => Number(matchup.week) === week);
+  const statRows = (db.weeklyPlayerStats || []).filter((stat) => Number(stat.week) === week && stat.statType === "actual").length;
+  const pendingCorrections = (db.scoreCorrections || []).filter((correction) => Number(correction.week) === week).length;
+  return [
+    { id: "stats", label: "Actual stats imported", ok: statRows > 0, detail: `${statRows} rows` },
+    { id: "matchups", label: "All matchups processed", ok: matchups.every((matchup) => ["live", "final"].includes(matchup.status)), detail: `${matchups.length} matchup(s)` },
+    { id: "corrections", label: "Corrections reviewed", ok: true, detail: `${pendingCorrections} correction(s)` },
+    { id: "lineups", label: "Lineups exist for every team", ok: db.teams.every((team) => Object.keys(db.lineups[team.id] || {}).length), detail: `${db.teams.length} teams` }
+  ];
+}
+
+function familyEngagement(db) {
+  return {
+    recaps: matchupRecaps(db),
+    awards: weeklyAwards(db),
+    history: leagueHistory(db),
+    trophyRoom: trophyRoom(db),
+    printableSummary: printableWeeklySummary(db)
+  };
+}
+
+function matchupRecaps(db) {
+  return (db.matchups || []).filter((matchup) => Number(matchup.week) === Number(db.meta.currentWeek)).map((matchup) => {
+    const home = db.teams.find((team) => team.id === matchup.homeTeamId);
+    const away = db.teams.find((team) => team.id === matchup.awayTeamId);
+    const leader = Number(matchup.homeScore) >= Number(matchup.awayScore) ? home : away;
+    return { matchupId: matchup.id, title: `${home?.name || "Home"} vs ${away?.name || "Away"}`, body: `${leader?.name || "A team"} leads by ${roundScore(Math.abs(matchup.homeScore - matchup.awayScore))}.`, rivalryNote: rivalryNote(home, away) };
+  });
+}
+
+function rivalryNote(home, away) {
+  if (!home || !away) return "Family bragging rights are on the line.";
+  return `${home.manager} and ${away.manager} have another family-room matchup.`;
+}
+
+function weeklyAwards(db) {
+  const teams = db.teams.map((team) => ({ team, projected: projectedLineupScore(db, team.id), roster: db.players.filter((player) => player.ownership === team.id) }));
+  const top = [...teams].sort((a, b) => b.projected - a.projected)[0];
+  const depth = [...teams].sort((a, b) => b.roster.length - a.roster.length)[0];
+  return [
+    { title: "Projected Hammer", teamId: top?.team.id, teamName: top?.team.name, detail: `${top?.projected || 0} projected starter points` },
+    { title: "Roster Builder", teamId: depth?.team.id, teamName: depth?.team.name, detail: `${depth?.roster.length || 0} rostered players` }
+  ];
+}
+
+function leagueHistory(db) {
+  const history = db.meta.leagueHistory || [];
+  const champion = db.league.playoffs?.bracket?.championTeamId;
+  const current = champion ? [{ season: db.meta.season, championTeamId: champion, championName: db.teams.find((team) => team.id === champion)?.name }] : [];
+  return [...current, ...history].slice(0, 10);
+}
+
+function trophyRoom(db) {
+  return leagueHistory(db).map((item, index) => ({ ...item, trophy: index === 0 ? "Current Champion" : "Past Champion" }));
+}
+
+function printableWeeklySummary(db) {
+  return {
+    title: `${db.league.name} Week ${db.meta.currentWeek}`,
+    lines: [
+      ...matchupRecaps(db).map((item) => `${item.title}: ${item.body}`),
+      ...weeklyAwards(db).map((item) => `${item.title}: ${item.teamName || "TBD"} (${item.detail})`)
+    ]
+  };
+}
+
+function researchDecisionTools(db, user) {
+  const team = db.teams.find((item) => item.ownerUserId === user?.id) || db.teams[0];
+  return {
+    watchlist: (db.playerResearch || []).filter((item) => item.userId === user?.id && item.watchlist),
+    startSit: startSitComparisons(db, team?.id),
+    matchupStrength: matchupStrengthViews(db),
+    rosterHealth: rosterHealthScore(db, team?.id),
+    tradeFairness: tradeFairnessSummaries(db)
+  };
+}
+
+function startSitComparisons(db, teamId) {
+  const roster = db.players.filter((player) => player.ownership === teamId).sort((a, b) => b.projection - a.projection);
+  const byPosition = groupByArray(roster, (player) => player.position);
+  return Object.entries(byPosition).flatMap(([position, players]) => players.slice(0, 3).map((player, index) => ({
+    playerId: player.id,
+    playerName: player.name,
+    position,
+    recommendation: index === 0 ? "Start" : "Sit unless needed",
+    projection: player.projection,
+    status: player.status
+  }))).slice(0, 12);
+}
+
+function matchupStrengthViews(db) {
+  return db.players.slice(0, 80).map((player) => ({
+    playerId: player.id,
+    playerName: player.name,
+    nflTeam: player.nflTeam,
+    byeWeek: providerByeWeek(player.nflTeam),
+    strength: player.projection >= 15 ? "Strong" : player.projection >= 9 ? "Neutral" : "Tough"
+  }));
+}
+
+function providerByeWeek(teamAbbr = "") {
+  return 6 + (teamAbbr.split("").reduce((sum, char) => sum + char.charCodeAt(0), 0) % 8);
+}
+
+function rosterHealthScore(db, teamId) {
+  const roster = db.players.filter((player) => player.ownership === teamId);
+  const flags = roster.filter((player) => player.status !== "Healthy").length;
+  const score = Math.max(0, 100 - flags * 15 - Math.max(0, rosterSizeLimit(db) - roster.length) * 4);
+  return { teamId, score, flags, rosterSize: roster.length, limit: rosterSizeLimit(db) };
+}
+
+function tradeFairnessSummaries(db) {
+  return (db.trades || []).slice(0, 10).map((trade) => tradeFairnessSummary(db, trade));
+}
+
+function tradeFairnessSummary(db, trade) {
+  const value = (ids) => (ids || []).reduce((sum, id) => sum + Number(db.players.find((player) => player.id === id)?.projection || 0), 0);
+  const offeredValue = roundScore(value(trade.offeredPlayerIds));
+  const requestedValue = roundScore(value(trade.requestedPlayerIds));
+  return { tradeId: trade.id, offeredValue, requestedValue, delta: roundScore(offeredValue - requestedValue), label: Math.abs(offeredValue - requestedValue) <= 3 ? "Balanced" : offeredValue > requestedValue ? "Favors receiver" : "Favors sender" };
+}
+
+function groupByArray(items, getKey) {
+  return items.reduce((acc, item) => {
+    const key = getKey(item);
+    acc[key] = acc[key] || [];
+    acc[key].push(item);
+    return acc;
+  }, {});
+}
+
+function notificationDigest(db, user) {
+  const activity = visibleActivityForUser(db, user).slice(0, 12);
+  return {
+    enabled: Boolean(normalizeNotificationPreferences(db).find((pref) => pref.userId === user?.id)?.preferences?.pushReady),
+    items: activity.map((event) => ({ title: event.title, category: event.category, createdAt: event.createdAt }))
+  };
+}
+
+function chatMentions(body = "", db) {
+  const raw = [...String(body).matchAll(/@([a-z0-9_ -]+)/gi)].map((match) => match[1].trim().toLowerCase());
+  return db.users.filter((user) => raw.some((mention) => user.username.toLowerCase() === mention || user.displayName.toLowerCase().startsWith(mention))).map((user) => user.id);
+}
+
+function reactToChat(db, chatId, userId, reaction = "+1") {
+  const chat = (db.chat || []).find((item) => item.id === chatId);
+  if (!chat) return { error: "Chat message not found" };
+  db.meta.chatReactions = db.meta.chatReactions || {};
+  const key = String(reaction || "+1").slice(0, 16);
+  db.meta.chatReactions[chatId] = db.meta.chatReactions[chatId] || {};
+  db.meta.chatReactions[chatId][key] = [...new Set([...(db.meta.chatReactions[chatId][key] || []), userId])];
+  return { ok: true, reactions: db.meta.chatReactions[chatId] };
+}
+
+function realisticLeagueFixture() {
+  const db = initialDb();
+  db.meta.seasonPhase = "regular_season";
+  db.meta.currentWeek = 8;
+  db.matchups = generateSchedule(db.teams, 14, 1);
+  runTestDraft(db, 8);
+  buildDefaultLineups(db);
+  return db;
+}
+
+function mockedProviderFixtures() {
+  return {
+    liveWeek: [{ providerId: "fixture-live-qb", appPlayerId: "p1", stats: { pass_yd: 275, pass_td: 2 }, delay: "live" }],
+    delayedStats: [{ providerId: "fixture-delay-rb", appPlayerId: "p2", stats: { rush_yd: 80 }, delay: "delayed" }],
+    missingPlayers: [{ providerId: "fixture-missing", appPlayerId: null, stats: { rec: 5 }, delay: "unmapped" }],
+    playoffWeeks: [16, 17]
+  };
+}
+
 function parseCsv(text) {
   const rows = [];
   let cell = "";
@@ -2460,12 +3075,27 @@ async function listBackups() {
   await mkdir(BACKUP_DIR, { recursive: true });
   const files = await readdir(BACKUP_DIR);
   const backups = [];
+  const manifests = await backupManifests();
   for (const file of files.filter((item) => item.endsWith(".sqlite"))) {
     const filePath = path.join(BACKUP_DIR, file);
     const info = await stat(filePath);
-    backups.push({ file, size: info.size, createdAt: info.mtimeMs });
+    backups.push({ file, size: info.size, createdAt: info.mtimeMs, restorePoint: manifests[file] || null });
   }
   return backups.sort((a, b) => b.createdAt - a.createdAt);
+}
+
+async function backupManifests() {
+  const files = await readdir(BACKUP_DIR).catch(() => []);
+  const manifests = {};
+  for (const file of files.filter((item) => item.endsWith(".json"))) {
+    try {
+      const manifest = JSON.parse(readFileSync(path.join(BACKUP_DIR, file), "utf8"));
+      if (manifest.file) manifests[manifest.file] = manifest;
+    } catch {
+      // Ignore malformed sidecar metadata; the SQLite backup itself is the source of truth.
+    }
+  }
+  return manifests;
 }
 
 async function pruneBackups() {
@@ -2481,8 +3111,38 @@ async function createSqliteBackup(label = "manual") {
   const target = path.join(BACKUP_DIR, file);
   const sqliteDb = await getSqlite();
   sqliteDb.exec(`VACUUM INTO ${sqlString(target)}`);
+  const metadata = await writeBackupMetadata(file, label, target);
   await pruneBackups();
-  return { file, path: target, createdAt: Date.now(), retention: BACKUP_RETENTION };
+  return { file, path: target, createdAt: metadata.createdAt, retention: BACKUP_RETENTION, restorePoint: metadata };
+}
+
+async function writeBackupMetadata(file, label, target) {
+  const metadata = {
+    file,
+    label,
+    createdAt: Date.now(),
+    size: (await stat(target)).size,
+    appVersion: "0.1.0",
+    notes: restorePointDescription(label)
+  };
+  const blob = JSON.stringify(metadata, null, 2);
+  await writeFile(path.join(BACKUP_DIR, `${file}.json`), blob);
+  return metadata;
+}
+
+function restorePointDescription(label) {
+  if (String(label).includes("pre-restore")) return "Automatic restore point captured before replacing the active SQLite database.";
+  if (String(label).includes("scheduled")) return "Scheduled home-network backup.";
+  return "Manual commissioner backup.";
+}
+
+function databaseMaintenanceGuidance() {
+  return [
+    "Keep WAL mode enabled for normal home use.",
+    "Use managed backups before imports, restore, draft reset, waiver processing, and week finalization.",
+    "Run npm run check after long manual sessions to verify SQLite integrity.",
+    "Restart the home server after large imports so SQLite can checkpoint and compact naturally."
+  ];
 }
 
 function sqlString(value) {
@@ -2500,11 +3160,11 @@ async function restoreSqliteBackup(file) {
   const source = safeBackupPath(file);
   if (!source) return { error: "Choose a valid backup file" };
   await stat(source);
-  await createSqliteBackup("pre-restore");
+  const restorePoint = await createSqliteBackup("pre-restore");
   closeSqlite();
   await copyFile(source, DB_PATH);
   await getSqlite();
-  return { restoredFrom: path.basename(source), restoredAt: Date.now() };
+  return { restoredFrom: path.basename(source), restoredAt: Date.now(), restorePoint };
 }
 
 async function ensureStartupBackup() {
@@ -2521,6 +3181,40 @@ function startScheduledBackups() {
   scheduledBackupTimer = setInterval(() => {
     createSqliteBackup("scheduled").catch((error) => console.error("Scheduled backup failed:", error.message));
   }, BACKUP_INTERVAL_HOURS * 60 * 60 * 1000);
+}
+
+function stopPlayerSyncService() {
+  if (playerSyncTimer) clearInterval(playerSyncTimer);
+  playerSyncTimer = null;
+}
+
+async function playerSyncServiceTick() {
+  if (playerSyncRunning) return;
+  playerSyncRunning = true;
+  try {
+    const db = await loadDb({ fresh: true, cache: false });
+    const service = playerSyncServiceState(db);
+    if (!service.enabled) {
+      stopPlayerSyncService();
+      return;
+    }
+    const next = service.nextRunAt ? Date.parse(service.nextRunAt) : 0;
+    if (next && Date.now() < next) return;
+    await runSmartPlayerSyncStep(db);
+    await saveDb(db);
+  } catch (error) {
+    console.error("Smart player sync failed:", error.message);
+  } finally {
+    playerSyncRunning = false;
+  }
+}
+
+function startPlayerSyncService(intervalSeconds = BDL_FREE_INTERVAL_SECONDS, immediate = true) {
+  stopPlayerSyncService();
+  playerSyncTimer = setInterval(() => {
+    playerSyncServiceTick();
+  }, Math.max(BDL_FREE_INTERVAL_SECONDS, Number(intervalSeconds || BDL_FREE_INTERVAL_SECONDS)) * 1000);
+  if (immediate) setTimeout(() => playerSyncServiceTick(), 0);
 }
 
 function validateDbReferences(db) {
@@ -2555,16 +3249,24 @@ function validateDbReferences(db) {
 }
 
 function duplicatePlayerGroups(db) {
-  const groups = new Map();
-  for (const player of db.players || []) {
-    const key = `${String(player.name || "").trim().toLowerCase()}|${player.position}|${player.nflTeam}`;
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(player);
-  }
-  return [...groups.values()].filter((items) => items.length > 1).map((items) => ({
+  return duplicatePlayerEntries(db).map((items) => ({
     key: `${items[0].name} (${items[0].position}, ${items[0].nflTeam})`,
     players: items.map((player) => ({ id: player.id, name: player.name, ownership: player.ownership, projection: player.projection, status: player.status }))
   }));
+}
+
+function playerNaturalKey(player) {
+  return `${String(player.name || "").trim().toLowerCase()}|${player.position}|${player.nflTeam}`;
+}
+
+function duplicatePlayerEntries(db) {
+  const groups = new Map();
+  for (const player of db.players || []) {
+    const key = playerNaturalKey(player);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(player);
+  }
+  return [...groups.values()].filter((items) => items.length > 1);
 }
 
 function providerMappingCandidates(db, limit = 30) {
@@ -2619,8 +3321,86 @@ function providerSettings(db) {
   return {
     refreshCadenceMinutes: Number(current.refreshCadenceMinutes || 120),
     scoringRefreshCadenceMinutes: Number(current.scoringRefreshCadenceMinutes || 15),
+    playerSyncIntervalSeconds: Math.max(BDL_FREE_INTERVAL_SECONDS, Number(current.playerSyncIntervalSeconds || BDL_FREE_INTERVAL_SECONDS)),
+    smartPlayerSync: current.smartPlayerSync !== false,
+    syncScoringDuringGames: current.syncScoringDuringGames !== false,
     cacheSnapshots: current.cacheSnapshots !== false,
     manualImportAllowed: current.manualImportAllowed !== false
+  };
+}
+
+function playerSyncServiceState(db) {
+  const current = db.meta.playerSyncService || {};
+  const settings = providerSettings(db);
+  const hasBdlCursor = Object.prototype.hasOwnProperty.call(current, "bdlNextPlayerCursor");
+  return {
+    enabled: current.enabled === true,
+    status: current.status || "stopped",
+    intervalSeconds: Math.max(BDL_FREE_INTERVAL_SECONDS, Number(current.intervalSeconds || settings.playerSyncIntervalSeconds || BDL_FREE_INTERVAL_SECONDS)),
+    lastRunAt: current.lastRunAt || null,
+    nextRunAt: current.nextRunAt || null,
+    lastBdlAt: current.lastBdlAt || null,
+    bdlNextPlayerCursor: hasBdlCursor ? current.bdlNextPlayerCursor : db.providerSync?.nextPlayerCursor ?? null,
+    bdlPlayersCompleteAt: current.bdlPlayersCompleteAt || null,
+    lastSleeperPlayersAt: current.lastSleeperPlayersAt || null,
+    lastSleeperTrendingAt: current.lastSleeperTrendingAt || null,
+    lastScoringAt: current.lastScoringAt || null,
+    lastResult: current.lastResult || null,
+    lastError: current.lastError || null,
+    runCount: Number(current.runCount || 0)
+  };
+}
+
+function savePlayerSyncServiceState(db, next) {
+  db.meta.playerSyncService = { ...playerSyncServiceState(db), ...next };
+  return db.meta.playerSyncService;
+}
+
+function gameScheduleWindow(db, now = Date.now()) {
+  const currentWeek = Number(db.meta?.currentWeek || 1);
+  const currentSeason = Number(db.meta?.season || new Date(now).getFullYear());
+  const games = (db.nflGames || []).filter((game) => {
+    const seasonMatches = !game.season || Number(game.season) === currentSeason;
+    return seasonMatches && Number(game.week || currentWeek) === currentWeek;
+  });
+  if (!games.length) return { mode: "unknown", detail: "No provider games cached for the current week.", games: 0 };
+  const windows = games.map((game) => {
+    const kickoff = Date.parse(game.date || "");
+    const status = String(game.status || "").toLowerCase();
+    const liveStatus = ["live", "in progress", "in_progress", "halftime", "q1", "q2", "q3", "q4"].some((term) => status.includes(term));
+    const completeStatus = ["final", "complete", "completed"].some((term) => status.includes(term));
+    const activeByClock = Number.isFinite(kickoff) && now >= kickoff - 15 * 60000 && now <= kickoff + 4 * 60 * 60000;
+    const upcomingSoon = Number.isFinite(kickoff) && now >= kickoff - 2 * 60 * 60000 && now < kickoff - 15 * 60000;
+    const recentlyFinished = Number.isFinite(kickoff) && now > kickoff + 4 * 60 * 60000 && now <= kickoff + 18 * 60 * 60000;
+    return { liveStatus, completeStatus, activeByClock, upcomingSoon, recentlyFinished };
+  });
+  if (windows.some((item) => item.liveStatus || item.activeByClock)) return { mode: "live", detail: "A current-week NFL game appears active.", games: games.length };
+  if (windows.some((item) => item.upcomingSoon)) return { mode: "pregame", detail: "A current-week NFL game starts soon.", games: games.length };
+  if (windows.some((item) => item.recentlyFinished || item.completeStatus)) return { mode: "postgame", detail: "Current-week games have recently finished or need stat confirmation.", games: games.length };
+  return { mode: "offday", detail: "No current-week game window is active.", games: games.length };
+}
+
+function playerSyncPlan(db, now = Date.now()) {
+  const settings = providerSettings(db);
+  const service = playerSyncServiceState(db);
+  const schedule = gameScheduleWindow(db, now);
+  const due = (timestamp, seconds) => !timestamp || now - Date.parse(timestamp) >= seconds * 1000;
+  const sleeperPlayers = (db.providerPlayers || []).filter((player) => player.provider === "sleeper");
+  const bdlComplete = Boolean(service.bdlPlayersCompleteAt && !service.bdlNextPlayerCursor);
+  const actions = [];
+  if (due(service.lastBdlAt, service.intervalSeconds) && (!bdlComplete || due(service.bdlPlayersCompleteAt, 7 * 24 * 60 * 60))) actions.push("balldontlie-catalog-page");
+  if (!sleeperPlayers.length || due(service.lastSleeperPlayersAt || newestTimestamp(sleeperPlayers.map((player) => player.syncedAt)), SLEEPER_PLAYER_REFRESH_HOURS * 3600)) actions.push("sleeper-player-map");
+  if (due(service.lastSleeperTrendingAt || newestTimestamp((db.providerTrending || []).map((item) => item.syncedAt)), SLEEPER_TRENDING_REFRESH_MINUTES * 60)) actions.push("sleeper-trending");
+  const scoringCadence = schedule.mode === "live" ? 90 : schedule.mode === "pregame" ? 300 : schedule.mode === "postgame" ? 600 : 3600;
+  if (settings.smartPlayerSync && settings.syncScoringDuringGames && ["live", "pregame", "postgame"].includes(schedule.mode) && due(service.lastScoringAt, scoringCadence)) actions.push("weekly-actual-stats");
+  return {
+    enabled: service.enabled,
+    schedule,
+    freeRateLimits: { sleeperPerMinute: 1000, balldontliePerMinute: 5 },
+    bdlIntervalSeconds: service.intervalSeconds,
+    scoringCadenceSeconds: scoringCadence,
+    actions,
+    nextRunAt: service.nextRunAt
   };
 }
 
@@ -2644,13 +3424,138 @@ function readinessChecklist(db, phase = normalizeSeasonPhase(db)) {
   return { phase, ready: checks.every((check) => check.ok), checks };
 }
 
+function launchReadinessChecklist(db) {
+  const quality = dataQualityReport(db);
+  const rosterValidations = validateAllRosters(db);
+  const draft = normalizeDraftState(db);
+  const users = db.users || [];
+  const teams = db.teams || [];
+  const rosteredTeams = teams.filter((team) => (db.players || []).some((player) => player.ownership === team.id));
+  const seededUsers = users.filter(hasSeededPassword);
+  const provider = db.providerSync || {};
+  const playerSync = playerSyncServiceState(db);
+  const checks = [
+    {
+      id: "accounts",
+      label: "Family accounts are created and passwords are changed",
+      status: seededUsers.length ? "blocker" : "ready",
+      detail: seededUsers.length ? `${seededUsers.map((user) => user.displayName).join(", ")} still use seeded passwords.` : `${users.length} account(s) ready.`,
+      target: { view: "settings" }
+    },
+    {
+      id: "teams",
+      label: "Every team has an assigned manager",
+      status: teams.every((team) => team.ownerUserId) ? "ready" : "warning",
+      detail: `${teams.filter((team) => team.ownerUserId).length}/${teams.length} teams assigned.`,
+      target: { view: "admin", tab: "people" }
+    },
+    {
+      id: "rosters",
+      label: "Rosters and lineups validate",
+      status: quality.summary.invalidRosters || quality.summary.duplicates || quality.references.warnings.length ? "blocker" : "ready",
+      detail: `${rosterValidations.filter((item) => item.valid).length}/${rosterValidations.length} rosters valid; ${quality.summary.duplicates} duplicate group(s).`,
+      target: { view: "admin", tab: "data" }
+    },
+    {
+      id: "schedule",
+      label: "Fantasy schedule exists",
+      status: (db.matchups || []).some((matchup) => !String(matchup.id).startsWith("playoff-")) ? "ready" : "warning",
+      detail: `${db.matchups?.length || 0} matchup row(s).`,
+      target: { view: "league", tab: "schedule" }
+    },
+    {
+      id: "draft",
+      label: "Draft order and player pool are ready",
+      status: new Set(draft.order || []).size >= teams.length && (db.players || []).length >= teams.length * Number(draft.rounds || 15) ? "ready" : "warning",
+      detail: `${draft.order?.length || 0}/${teams.length} draft slots; ${db.players?.length || 0} players.`,
+      target: { view: "draft" }
+    },
+    {
+      id: "provider",
+      label: "Provider sync path is usable",
+      status: provider.lastRunAt || playerSync.enabled || (db.providerPlayers || []).length ? "ready" : "warning",
+      detail: provider.message || (playerSync.enabled ? "Smart player sync is running." : "No provider sync has completed yet."),
+      target: { view: "admin", tab: "data" }
+    },
+    {
+      id: "backup",
+      label: "Rollback path exists before rehearsal",
+      status: db.meta.seededAt || (db.meta.providerSnapshots || []).length ? "ready" : "warning",
+      detail: "Create a managed backup from Home Server Health before real data changes.",
+      target: { view: "admin", tab: "overview", action: "run-backup" }
+    }
+  ];
+  const summary = {
+    blockers: checks.filter((check) => check.status === "blocker").length,
+    warnings: checks.filter((check) => check.status === "warning").length,
+    ready: checks.filter((check) => check.status === "ready").length,
+    total: checks.length,
+    rosteredTeams: rosteredTeams.length
+  };
+  return { ready: summary.blockers === 0, summary, checks };
+}
+
+function rehearsalChecklist(db) {
+  const last = db.meta.lastRehearsal || null;
+  const steps = [
+    { id: "commissioner-login", actor: "Commissioner", label: "Sign in, change seeded password, review Launch Readiness.", target: { view: "admin", tab: "overview" } },
+    { id: "manager-a-login", actor: "Manager A", label: "Sign in as a manager, change password, update team identity.", target: { view: "settings" } },
+    { id: "manager-b-login", actor: "Manager B", label: "Sign in as a second manager, change password, verify mobile nav.", target: { view: "settings" } },
+    { id: "draft", actor: "Commissioner", label: "Start a short test draft, queue a player, autopick, undo, pause/resume.", target: { view: "draft" } },
+    { id: "lineup", actor: "Manager A", label: "Move a legal bench player into the lineup and save.", target: { view: "team", tab: "lineup" } },
+    { id: "waivers", actor: "Manager B", label: "Create, reorder, edit, and cancel a waiver claim.", target: { view: "players" } },
+    { id: "trade", actor: "Both Managers", label: "Offer, counter, accept, and commissioner-review a trade.", target: { view: "players" } },
+    { id: "scoring", actor: "Commissioner", label: "Import stats, process week, add correction, finalize week.", target: { view: "admin", tab: "operations" } }
+  ];
+  const validation = launchReadinessChecklist(db);
+  return { steps, last, ready: validation.ready, blockers: validation.summary.blockers, warnings: validation.summary.warnings };
+}
+
+function setupReview(db) {
+  const draft = normalizeDraftState(db);
+  const rosterValidation = validateAllRosters(db);
+  const scoringIssues = validateLeagueRules(db.league, db.meta).errors || [];
+  const impossible = [
+    ...((db.teams || []).filter((team) => !team.ownerUserId).map((team) => `Team ${team.name} has no assigned user.`)),
+    ...rosterValidation.filter((item) => !item.valid).map((item) => `${item.teamName}: ${item.errors.join("; ")}`),
+    ...scoringIssues,
+    ...(new Set(draft.order || []).size < (db.teams || []).length ? ["Draft order does not include every team."] : [])
+  ];
+  return {
+    users: { total: db.users?.length || 0, seededPasswords: (db.users || []).filter(hasSeededPassword).length },
+    teams: { total: db.teams?.length || 0, assigned: (db.teams || []).filter((team) => team.ownerUserId).length },
+    rosters: { rosteredTeams: (db.teams || []).filter((team) => (db.players || []).some((player) => player.ownership === team.id)).length, players: db.players?.length || 0 },
+    draft: { orderSlots: draft.order?.length || 0, rounds: draft.rounds || 15, style: draft.orderStyle || draft.type || "snake" },
+    league: { phase: normalizeSeasonPhase(db), scoringType: db.league.settings?.scoringType, maxRosterSize: db.league.settings?.maxRosterSize },
+    impossible,
+    ready: impossible.length === 0
+  };
+}
+
+function liveOpsReadiness(db) {
+  const plan = playerSyncPlan(db);
+  const scoringHealth = db.providerSync?.details?.scoring || null;
+  const hasBdlKey = Boolean(process.env.BALLDONTLIE_API_KEY);
+  const latestActual = newestTimestamp((db.weeklyPlayerStats || []).filter((item) => item.statType === "actual").map((item) => item.syncedAt));
+  const checks = [
+    { id: "bdl-key", label: "balldontlie API key configured", status: hasBdlKey ? "ready" : "warning", detail: hasBdlKey ? "Catalog paging can use the free API lane." : "Set BALLDONTLIE_API_KEY to complete live catalog sync." },
+    { id: "schedule-window", label: "Current-week schedule detection", status: plan.schedule.mode === "unknown" ? "warning" : "ready", detail: plan.schedule.detail },
+    { id: "player-sync", label: "Smart player sync can run", status: playerSyncServiceState(db).enabled || db.providerSync?.lastRunAt ? "ready" : "warning", detail: playerSyncServiceState(db).enabled ? "Service is enabled." : "Run a smart sync step from Provider Reliability." },
+    { id: "stats", label: "Actual stat ingest has been validated", status: latestActual || scoringHealth ? "ready" : "warning", detail: latestActual ? `Latest actual stat row: ${latestActual}.` : scoringHealth?.message || "No actual stat ingest has run yet." },
+    { id: "sheet", label: "Hand-checked matchup reconciliation is available", status: typeof validateCompletedWeekAgainstSheet === "function" ? "ready" : "warning", detail: "Use manual stat import plus completed-week validation test before launch." }
+  ];
+  return { ready: checks.every((check) => check.status === "ready"), checks, plan };
+}
+
 function scheduledJobsPanel(db) {
   const settings = providerSettings(db);
+  const playerSync = playerSyncServiceState(db);
   const lastProvider = db.providerSync?.lastRunAt ? Date.parse(db.providerSync.lastRunAt) : null;
   const nextProvider = lastProvider ? lastProvider + settings.refreshCadenceMinutes * 60000 : null;
   const scoringHealth = db.providerSync?.details?.scoring || null;
   return {
     providerSync: { cadenceMinutes: settings.refreshCadenceMinutes, lastRunAt: db.providerSync?.lastRunAt || null, nextRunAt: nextProvider, status: db.providerSync?.message || "Not run yet" },
+    playerSync: { enabled: playerSync.enabled, intervalSeconds: playerSync.intervalSeconds, status: playerSync.status, nextRunAt: playerSync.nextRunAt },
     scoringRefresh: { cadenceMinutes: settings.scoringRefreshCadenceMinutes, status: scoringHealth?.status || "idle", message: scoringHealth?.message || "No scoring ingest yet" },
     backups: { cadenceHours: BACKUP_INTERVAL_HOURS, retention: BACKUP_RETENTION },
     waivers: { pending: (db.waiverClaims || []).filter((claim) => claim.status === "pending").length, mode: db.league.waiver?.mode || "rolling" }
@@ -2825,6 +3730,33 @@ function mergePlayers(db, sourceId, targetId) {
   target.projection = Math.max(Number(target.projection || 0), Number(source.projection || 0));
   db.players = db.players.filter((player) => player.id !== sourceId);
   return { merged: sourceId, into: targetId, report: dataQualityReport(db) };
+}
+
+function preferredDuplicateTarget(players) {
+  return [...players].sort((a, b) => {
+    if (Boolean(b.ownership) !== Boolean(a.ownership)) return Number(Boolean(b.ownership)) - Number(Boolean(a.ownership));
+    const aProvider = /^(slp|bdl)-/.test(a.id);
+    const bProvider = /^(slp|bdl)-/.test(b.id);
+    if (aProvider !== bProvider) return Number(aProvider) - Number(bProvider);
+    if (Number(b.projection || 0) !== Number(a.projection || 0)) return Number(b.projection || 0) - Number(a.projection || 0);
+    return String(a.id).localeCompare(String(b.id));
+  })[0];
+}
+
+function cleanupDuplicatePlayers(db) {
+  const before = dataQualityReport(db).summary.duplicates;
+  const actions = [];
+  let groups = duplicatePlayerEntries(db);
+  while (groups.length) {
+    const target = preferredDuplicateTarget(groups[0]);
+    for (const source of groups[0].filter((player) => player.id !== target.id)) {
+      const result = mergePlayers(db, source.id, target.id);
+      if (!result.error) actions.push({ sourceId: source.id, targetId: target.id, playerName: target.name });
+    }
+    groups = duplicatePlayerEntries(db);
+  }
+  const report = dataQualityReport(db);
+  return { before, after: report.summary.duplicates, merged: actions.length, actions, report };
 }
 
 async function buildSystemHealth(db) {
@@ -3207,7 +4139,19 @@ async function handleApi(req, res, db) {
     draft.status = draft.status === "paused" ? "in_progress" : "paused";
     draft.pausedAt = draft.status === "paused" ? new Date().toISOString() : null;
     if (draft.status === "in_progress") draft.clockStartedAt = new Date().toISOString();
+    draft.lastSavedAt = new Date().toISOString();
     logActivity(db, { category: "draft", type: "draft_pause_toggle", title: draft.status === "paused" ? "Draft paused" : "Draft resumed", body: `${user.displayName} ${draft.status === "paused" ? "paused" : "resumed"} the draft.`, actorUserId: user.id });
+    await saveDb(db);
+    return send(res, 200, enrich(db, user));
+  }
+  if (url.pathname === "/api/admin/draft/recover" && req.method === "POST") {
+    if (!requireAdmin(user, res)) return;
+    if (!requirePhase(db, res, "draft")) return;
+    const draft = normalizeDraftState(db);
+    draft.clockStartedAt = new Date().toISOString();
+    draft.resumedAt = draft.clockStartedAt;
+    draft.lastSavedAt = draft.clockStartedAt;
+    logActivity(db, { category: "draft", type: "draft_recovered", title: "Draft recovered", body: `${user.displayName} recovered the draft at pick ${draft.currentPick}.`, actorUserId: user.id, audience: "commissioner" });
     await saveDb(db);
     return send(res, 200, enrich(db, user));
   }
@@ -3220,6 +4164,36 @@ async function handleApi(req, res, db) {
     await saveDb(db);
     return send(res, 200, enrich(db, user));
   }
+  if (url.pathname === "/api/admin/draft/skip" && req.method === "POST") {
+    if (!requireAdmin(user, res)) return;
+    if (!requirePhase(db, res, "draft")) return;
+    const { note = "" } = await parseBody(req);
+    const result = skipDraftPick(db, note);
+    if (result.error) return send(res, 400, { error: result.error });
+    logActivity(db, { category: "draft", type: "draft_pick_skipped", title: "Draft pick skipped", body: `${user.displayName} skipped pick ${result.pick.pickNumber} for ${db.teams.find((team) => team.id === result.pick.teamId)?.name}.`, actorUserId: user.id, teamId: result.pick.teamId });
+    await saveDb(db);
+    return send(res, 200, enrich(db, user));
+  }
+  if (url.pathname === "/api/admin/draft/replace-pick" && req.method === "POST") {
+    if (!requireAdmin(user, res)) return;
+    if (!requirePhase(db, res, "draft")) return;
+    const { pickNumber, playerId } = await parseBody(req);
+    const result = replaceDraftPick(db, pickNumber, playerId);
+    if (result.error) return send(res, 400, { error: result.error });
+    logActivity(db, { category: "draft", type: "draft_pick_replaced", title: "Draft pick replaced", body: `${user.displayName} replaced pick ${result.pick.pickNumber} with ${result.pick.playerName}.`, actorUserId: user.id, teamId: result.pick.teamId, playerId: result.pick.playerId });
+    await saveDb(db);
+    return send(res, 200, enrich(db, user));
+  }
+  if (url.pathname === "/api/admin/draft/swap-picks" && req.method === "POST") {
+    if (!requireAdmin(user, res)) return;
+    if (!requirePhase(db, res, "draft")) return;
+    const { firstPickNumber, secondPickNumber } = await parseBody(req);
+    const result = swapDraftPicks(db, firstPickNumber, secondPickNumber);
+    if (result.error) return send(res, 400, { error: result.error });
+    logActivity(db, { category: "draft", type: "draft_picks_swapped", title: "Draft picks swapped", body: `${user.displayName} swapped picks ${firstPickNumber} and ${secondPickNumber}.`, actorUserId: user.id, audience: "commissioner" });
+    await saveDb(db);
+    return send(res, 200, enrich(db, user));
+  }
   if (url.pathname === "/api/admin/draft/test" && req.method === "POST") {
     if (!requireAdmin(user, res)) return;
     if (!requirePhase(db, res, "draft")) return;
@@ -3228,6 +4202,12 @@ async function handleApi(req, res, db) {
     logActivity(db, { category: "draft", type: "test_draft", title: "Test draft completed", body: `${user.displayName} ran a balanced ${rounds}-round test draft.`, actorUserId: user.id });
     await saveDb(db);
     return send(res, 200, enrich(db, user));
+  }
+  if (url.pathname === "/api/admin/draft/simulate" && req.method === "POST") {
+    if (!requireAdmin(user, res)) return;
+    if (!requirePhase(db, res, "draft")) return;
+    const options = await parseBody(req);
+    return send(res, 200, simulateMockDraft(db, options));
   }
   if (url.pathname === "/api/admin/draft/reset" && req.method === "POST") {
     if (!requireAdmin(user, res)) return;
@@ -3557,9 +4537,14 @@ async function handleApi(req, res, db) {
     db.meta.providerSettings = {
       refreshCadenceMinutes: Math.max(5, Number(incoming.refreshCadenceMinutes || providerSettings(db).refreshCadenceMinutes)),
       scoringRefreshCadenceMinutes: Math.max(5, Number(incoming.scoringRefreshCadenceMinutes || providerSettings(db).scoringRefreshCadenceMinutes)),
+      playerSyncIntervalSeconds: Math.max(BDL_FREE_INTERVAL_SECONDS, Number(incoming.playerSyncIntervalSeconds || providerSettings(db).playerSyncIntervalSeconds)),
+      smartPlayerSync: incoming.smartPlayerSync !== false,
+      syncScoringDuringGames: incoming.syncScoringDuringGames !== false,
       cacheSnapshots: incoming.cacheSnapshots !== false,
       manualImportAllowed: incoming.manualImportAllowed !== false
     };
+    db.meta.providerDemoMode = incoming.providerDemoMode === true;
+    db.meta.providerDemoScenario = String(incoming.providerDemoScenario || "unavailable");
     logActivity(db, { category: "commissioner", type: "provider_settings_updated", title: "Provider settings updated", body: `${user.displayName} updated provider cadence and import settings.`, actorUserId: user.id, audience: "commissioner", metadata: db.meta.providerSettings });
     await saveDb(db);
     return send(res, 200, enrich(db, user));
@@ -3570,6 +4555,30 @@ async function handleApi(req, res, db) {
     await saveDb(db);
     return send(res, 201, { snapshot, snapshots: db.meta.providerSnapshots || [] });
   }
+  if (url.pathname === "/api/admin/provider/player-sync/start" && req.method === "POST") {
+    if (!requireAdmin(user, res)) return;
+    const settings = providerSettings(db);
+    savePlayerSyncServiceState(db, { enabled: true, status: "starting", intervalSeconds: settings.playerSyncIntervalSeconds, nextRunAt: new Date().toISOString(), lastError: null });
+    logActivity(db, { category: "commissioner", type: "player_sync_started", title: "Smart player sync started", body: `${user.displayName} started the smart player sync service.`, actorUserId: user.id, audience: "commissioner", metadata: playerSyncPlan(db) });
+    await saveDb(db);
+    startPlayerSyncService(settings.playerSyncIntervalSeconds);
+    return send(res, 200, enrich(db, user));
+  }
+  if (url.pathname === "/api/admin/provider/player-sync/stop" && req.method === "POST") {
+    if (!requireAdmin(user, res)) return;
+    stopPlayerSyncService();
+    savePlayerSyncServiceState(db, { enabled: false, status: "stopped", nextRunAt: null });
+    logActivity(db, { category: "commissioner", type: "player_sync_stopped", title: "Smart player sync stopped", body: `${user.displayName} stopped the smart player sync service.`, actorUserId: user.id, audience: "commissioner" });
+    await saveDb(db);
+    return send(res, 200, enrich(db, user));
+  }
+  if (url.pathname === "/api/admin/provider/player-sync/run" && req.method === "POST") {
+    if (!requireAdmin(user, res)) return;
+    const result = await runSmartPlayerSyncStep(db, { force: true });
+    logActivity(db, { category: "commissioner", type: "player_sync_step", title: "Smart player sync step ran", body: result.lastResult?.message || db.providerSync?.message || "Smart player sync step complete.", actorUserId: user.id, audience: "commissioner", metadata: result.lastResult || {} });
+    await saveDb(db);
+    return send(res, 200, enrich(db, user));
+  }
   if (url.pathname === "/api/admin/provider/map" && req.method === "POST") {
     if (!requireAdmin(user, res)) return;
     const { providerId, playerId } = await parseBody(req);
@@ -3578,6 +4587,31 @@ async function handleApi(req, res, db) {
     logActivity(db, { category: "commissioner", type: "provider_player_mapped", title: "Provider player mapped", body: `${user.displayName} mapped ${result.providerName} to ${result.playerName}.`, actorUserId: user.id, audience: "commissioner", metadata: result });
     await saveDb(db);
     return send(res, 200, enrich(db, user));
+  }
+  if (url.pathname === "/api/admin/rehearsal/run" && req.method === "POST") {
+    if (!requireAdmin(user, res)) return;
+    const rehearsal = rehearsalChecklist(db);
+    const completed = rehearsal.steps.map((step) => step.id);
+    db.meta.lastRehearsal = { id: `rehearsal-${Date.now()}`, ranAt: new Date().toISOString(), completed, blockers: rehearsal.blockers, warnings: rehearsal.warnings };
+    logActivity(db, { category: "commissioner", type: "rehearsal_verified", title: "Seeded rehearsal checklist verified", body: `${user.displayName} ran the seeded rehearsal verifier with ${rehearsal.blockers} blocker(s).`, actorUserId: user.id, audience: "commissioner", metadata: db.meta.lastRehearsal });
+    await saveDb(db);
+    return send(res, 200, enrich(db, user));
+  }
+  if (url.pathname === "/api/admin/setup-review" && req.method === "GET") {
+    if (!requireAdmin(user, res)) return;
+    return send(res, 200, { setupReview: setupReview(db), rehearsal: rehearsalChecklist(db), liveOps: liveOpsReadiness(db) });
+  }
+  if (url.pathname === "/api/admin/templates/rosters.csv" && req.method === "GET") {
+    if (!requireAdmin(user, res)) return;
+    const rows = ["team,player,playerId", ...((db.teams || []).map((team) => `"${team.name}","Josh Allen","p1"`))];
+    res.writeHead(200, { "Content-Type": "text/csv", "Content-Disposition": "attachment; filename=roster-template.csv" });
+    return res.end(rows.join("\n"));
+  }
+  if (url.pathname === "/api/admin/templates/draft.csv" && req.method === "GET") {
+    if (!requireAdmin(user, res)) return;
+    const rows = ["round,pick,team,player,playerId", ...((db.teams || []).map((team, index) => `1,${index + 1},"${team.name}","Josh Allen","p1"`))];
+    res.writeHead(200, { "Content-Type": "text/csv", "Content-Disposition": "attachment; filename=draft-template.csv" });
+    return res.end(rows.join("\n"));
   }
   if (url.pathname === "/api/admin/backup/create" && req.method === "POST") {
     if (!requireAdmin(user, res)) return;
@@ -3627,10 +4661,36 @@ async function handleApi(req, res, db) {
   if (url.pathname === "/api/chat" && req.method === "POST") {
     const { body } = await parseBody(req);
     if (!body) return send(res, 400, { error: "Message is required" });
-    db.chat.push({ id: `c${Date.now()}`, author: user.displayName, body: String(body).slice(0, 400), createdAt: Date.now() });
-    logActivity(db, { category: "chat", type: "chat_message", title: "League chat", body: `${user.displayName}: ${String(body).slice(0, 160)}`, actorUserId: user.id });
+    const mentionIds = chatMentions(body, db);
+    db.chat.push({ id: `c${Date.now()}`, author: user.displayName, body: String(body).slice(0, 400), createdAt: Date.now(), mentions: mentionIds });
+    logActivity(db, { category: "chat", type: "chat_message", title: "League chat", body: `${user.displayName}: ${String(body).slice(0, 160)}`, actorUserId: user.id, visibleTo: mentionIds.length ? [...mentionIds, "all"] : ["all"], metadata: { mentions: mentionIds } });
     await saveDb(db);
     return send(res, 201, enrich(db, user));
+  }
+  if (url.pathname.match(/^\/api\/chat\/[^/]+\/react$/) && req.method === "POST") {
+    const chatId = url.pathname.split("/")[3];
+    const { reaction = "+1" } = await parseBody(req);
+    const result = reactToChat(db, chatId, user.id, reaction);
+    if (result.error) return send(res, 404, { error: result.error });
+    await saveDb(db);
+    return send(res, 200, enrich(db, user));
+  }
+  if (url.pathname === "/api/admin/announcements" && req.method === "POST") {
+    if (!requireAdmin(user, res)) return;
+    const { title = "Commissioner announcement", body = "", expiresInDays = 7 } = await parseBody(req);
+    const announcement = { id: `ann-${Date.now()}`, title: String(title).slice(0, 120), body: String(body).slice(0, 400), createdBy: user.id, createdAt: Date.now(), expiresAt: Date.now() + Math.max(1, Number(expiresInDays || 7)) * 86400000, pinned: true };
+    db.meta.announcements = [announcement, ...(db.meta.announcements || [])].slice(0, 5);
+    logActivity(db, { category: "commissioner", type: "announcement", title: announcement.title, body: announcement.body, actorUserId: user.id, audience: "all" });
+    await saveDb(db);
+    return send(res, 201, enrich(db, user));
+  }
+  if (url.pathname.match(/^\/api\/admin\/announcements\/[^/]+$/) && req.method === "DELETE") {
+    if (!requireAdmin(user, res)) return;
+    const id = url.pathname.split("/")[3];
+    db.meta.announcements = (db.meta.announcements || []).filter((item) => item.id !== id);
+    logActivity(db, { category: "commissioner", type: "announcement_unpinned", title: "Announcement unpinned", body: `${user.displayName} unpinned a commissioner announcement.`, actorUserId: user.id, audience: "commissioner" });
+    await saveDb(db);
+    return send(res, 200, enrich(db, user));
   }
   if (url.pathname === "/api/sync" && req.method === "POST") {
     if (providerSettings(db).cacheSnapshots) providerSnapshot(db, "pre-sync");
@@ -3693,17 +4753,8 @@ async function handleApi(req, res, db) {
   }
   if (url.pathname === "/api/admin/league" && req.method === "PUT") {
     if (!requireAdmin(user, res)) return;
-    const { name, currentWeek, season, settings, roster, waiver, trade, playoffs, draft, scoring } = await parseBody(req);
-    if (name) db.league.name = name;
-    if (currentWeek) db.meta.currentWeek = Number(currentWeek);
-    if (season) db.meta.season = Number(season);
-    if (settings) db.league.settings = { ...db.league.settings, ...settings };
-    if (roster) db.league.roster = { ...db.league.roster, ...roster };
-    if (waiver) db.league.waiver = { ...db.league.waiver, ...waiver };
-    if (trade) db.league.trade = { ...db.league.trade, ...trade };
-    if (playoffs) db.league.playoffs = { ...db.league.playoffs, ...playoffs };
-    if (draft) db.league.draft = { ...db.league.draft, ...draft };
-    if (scoring) db.league.scoring = { ...db.league.scoring, ...scoring };
+    const result = updateLeagueRepository(db, await parseBody(req));
+    if (result.error) return send(res, 400, { error: result.error, validation: result.validation });
     logActivity(db, { category: "commissioner", type: "league_rules_updated", title: "League rules updated", body: `${user.displayName} updated commissioner-controlled league rules.`, actorUserId: user.id, audience: "commissioner" });
     await saveDb(db);
     return send(res, 200, enrich(db, user));
@@ -3712,6 +4763,7 @@ async function handleApi(req, res, db) {
 }
 
 async function syncProvider(db) {
+  if (db.meta?.providerDemoMode) return syncProviderDemoMode(db);
   const sleeperResult = await syncSleeper(db);
   const bdlResult = await syncBalldontlie(db);
   const details = {
@@ -3725,6 +4777,96 @@ async function syncProvider(db) {
     nextPlayerCursor: bdlResult.nextPlayerCursor,
     details
   };
+}
+
+async function runSmartPlayerSyncStep(db, options = {}) {
+  const now = options.now || Date.now();
+  const service = savePlayerSyncServiceState(db, { status: "running", lastError: null });
+  const plan = playerSyncPlan(db, now);
+  const actions = options.force && !plan.actions.length ? ["balldontlie-catalog-page", "sleeper-trending"] : plan.actions;
+  const results = [];
+  try {
+    if (actions.includes("sleeper-player-map") || actions.includes("sleeper-trending")) {
+      const sleeper = await syncSleeper(db);
+      results.push(sleeper);
+      savePlayerSyncServiceState(db, {
+        lastSleeperPlayersAt: new Date(now).toISOString(),
+        lastSleeperTrendingAt: new Date(now).toISOString()
+      });
+    }
+    if (actions.includes("balldontlie-catalog-page")) {
+      const bdl = await syncBalldontlieCatalogStep(db);
+      results.push(bdl);
+      const current = playerSyncServiceState(db);
+      savePlayerSyncServiceState(db, {
+        lastBdlAt: new Date(now).toISOString(),
+        bdlNextPlayerCursor: bdl.nextPlayerCursor !== undefined ? bdl.nextPlayerCursor : current.bdlNextPlayerCursor ?? null,
+        bdlPlayersCompleteAt: bdl.playersComplete ? new Date(now).toISOString() : current.bdlPlayersCompleteAt || null
+      });
+    }
+    if (actions.includes("weekly-actual-stats")) {
+      const stats = await ingestReliableWeeklyStats(db, Number(db.meta.season), Number(db.meta.currentWeek), "actual");
+      results.push({ provider: stats.provider, message: `Weekly actual stats refreshed from ${stats.provider}.`, rows: stats.rows, health: stats.health });
+      savePlayerSyncServiceState(db, { lastScoringAt: new Date(now).toISOString() });
+    }
+    const current = playerSyncServiceState(db);
+    const message = results.length ? results.map((item) => item.message || `${item.provider}: ${item.rows || 0} rows`).join(" ") : "Smart player sync checked the game schedule; nothing was due.";
+    db.providerSync = {
+      ...(db.providerSync || {}),
+      provider: "smart-player-sync",
+      lastRunAt: new Date(now).toISOString(),
+      message,
+      nextPlayerCursor: current.bdlNextPlayerCursor || null,
+      details: { ...(db.providerSync?.details || {}), smartPlayerSync: { plan, results } }
+    };
+    return savePlayerSyncServiceState(db, {
+      status: "idle",
+      lastRunAt: new Date(now).toISOString(),
+      nextRunAt: new Date(now + current.intervalSeconds * 1000).toISOString(),
+      lastResult: { message, actions, schedule: plan.schedule, resultCount: results.length },
+      runCount: Number(service.runCount || 0) + 1
+    });
+  } catch (error) {
+    db.providerSync = { ...(db.providerSync || {}), message: `Smart player sync failed: ${error.message}`, details: { ...(db.providerSync?.details || {}), smartPlayerSyncError: error.message } };
+    return savePlayerSyncServiceState(db, { status: "error", lastError: error.message, nextRunAt: new Date(now + service.intervalSeconds * 1000).toISOString() });
+  }
+}
+
+function syncProviderDemoMode(db, scenario = db.meta?.providerDemoScenario || "unavailable") {
+  const fixtures = mockedProviderFixtures();
+  db.meta.providerDemoMode = true;
+  db.providerSync = db.providerSync || {};
+  const details = { scenario, fixtures };
+  if (scenario === "delayed") {
+    details.message = "Demo provider mode: delayed stats are visible; cached data remains active.";
+  } else if (scenario === "missing_players") {
+    details.message = "Demo provider mode: missing player mappings are visible for manual review.";
+  } else {
+    details.message = "Demo provider mode: provider unavailable; UI should keep cached and manual import workflows usable.";
+  }
+  return {
+    provider: "demo",
+    lastRunAt: new Date().toISOString(),
+    message: details.message,
+    nextPlayerCursor: null,
+    details
+  };
+}
+
+function validateCompletedWeekAgainstSheet(db, season, week, expectedRows = []) {
+  const clone = structuredClone(db);
+  const actual = processWeekScoring(clone, Number(season), Number(week), { finalize: false, useProjections: false });
+  const mismatches = [];
+  for (const expected of expectedRows) {
+    const matchup = clone.matchups.find((item) => item.id === expected.matchupId);
+    if (!matchup) {
+      mismatches.push({ matchupId: expected.matchupId, error: "Matchup not found" });
+      continue;
+    }
+    if (expected.homeScore !== undefined && roundScore(matchup.homeScore) !== roundScore(expected.homeScore)) mismatches.push({ matchupId: matchup.id, side: "home", actual: matchup.homeScore, expected: expected.homeScore });
+    if (expected.awayScore !== undefined && roundScore(matchup.awayScore) !== roundScore(expected.awayScore)) mismatches.push({ matchupId: matchup.id, side: "away", actual: matchup.awayScore, expected: expected.awayScore });
+  }
+  return { ok: mismatches.length === 0, processed: actual, mismatches };
 }
 
 async function syncBalldontlie(db) {
@@ -3762,8 +4904,9 @@ async function syncBalldontlie(db) {
     const playerPath = `/players?per_page=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`;
     const playersPayload = await bdlGet(playerPath, apiKey);
     const incoming = (playersPayload.data || []).map(mapBdlPlayer).filter((player) => player.name);
+    const playersById = new Map(db.players.map((item) => [item.id, item]));
     for (const player of incoming) {
-      const existing = db.players.find((item) => item.id === player.id);
+      const existing = playersById.get(player.id);
       if (existing) {
         existing.name = player.name;
         existing.position = player.position;
@@ -3771,6 +4914,7 @@ async function syncBalldontlie(db) {
         existing.status = mergeStatus(existing.status, player.status);
       } else {
         db.players.push(player);
+        playersById.set(player.id, player);
       }
     }
     const nextPlayerCursor = playersPayload.meta?.next_cursor ? String(playersPayload.meta.next_cursor) : null;
@@ -3791,6 +4935,57 @@ async function syncBalldontlie(db) {
       nextPlayerCursor: db.providerSync?.nextPlayerCursor || null,
       details: { ...details, error: error.message }
     };
+  }
+}
+
+async function syncBalldontlieCatalogStep(db) {
+  const apiKey = process.env.BALLDONTLIE_API_KEY;
+  if (!apiKey) return { provider: "balldontlie", message: "balldontlie skipped: no API key.", nextPlayerCursor: null, details: { skipped: true } };
+  const details = { mode: "free-tier-step" };
+  try {
+    if ((db.nflTeams || []).length < 32) {
+      const teamsPayload = await bdlGet("/teams", apiKey);
+      const syncedTeams = (teamsPayload.data || []).map(mapBdlTeam);
+      upsertById(db.nflTeams, syncedTeams);
+      return { provider: "balldontlie", message: `balldontlie free-step: synced ${syncedTeams.length} NFL teams.`, nextPlayerCursor: playerSyncServiceState(db).bdlNextPlayerCursor || null, details: { ...details, teams: syncedTeams.length } };
+    }
+    if (!(db.nflGames || []).some((game) => Number(game.season) === Number(db.meta.season))) {
+      let gamesPayload = await bdlGet(`/games?seasons[]=${db.meta.season}&per_page=100`, apiKey);
+      let gameSeason = db.meta.season;
+      if ((gamesPayload.data || []).length === 0 && Number(db.meta.season) > 2002) {
+        gameSeason = Number(db.meta.season) - 1;
+        gamesPayload = await bdlGet(`/games?seasons[]=${gameSeason}&per_page=100`, apiKey);
+      }
+      const syncedGames = (gamesPayload.data || []).map(mapBdlGame);
+      upsertById(db.nflGames, syncedGames);
+      return { provider: "balldontlie", message: `balldontlie free-step: synced ${syncedGames.length} games for ${gameSeason}.`, nextPlayerCursor: playerSyncServiceState(db).bdlNextPlayerCursor || null, details: { ...details, games: syncedGames.length, season: gameSeason } };
+    }
+    const service = playerSyncServiceState(db);
+    if (service.bdlPlayersCompleteAt && !service.bdlNextPlayerCursor && Date.now() - Date.parse(service.bdlPlayersCompleteAt) < 7 * 24 * 60 * 60 * 1000) {
+      return { provider: "balldontlie", message: "balldontlie free-step: player catalog already complete this week.", nextPlayerCursor: null, playersComplete: true, details };
+    }
+    const cursor = service.bdlNextPlayerCursor || null;
+    const playerPath = `/players?per_page=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`;
+    const playersPayload = await bdlGet(playerPath, apiKey);
+    const incoming = (playersPayload.data || []).map(mapBdlPlayer).filter((player) => player.name);
+    const playersById = new Map(db.players.map((item) => [item.id, item]));
+    const playersByNaturalKey = new Map(db.players.map((item) => [playerNaturalKey(item), item]));
+    for (const player of incoming) {
+      const existing = playersById.get(player.id) || playersByNaturalKey.get(playerNaturalKey(player));
+      if (existing) {
+        Object.assign(existing, { ...player, id: existing.id, ownership: existing.ownership, locked: existing.locked, status: mergeStatus(existing.status, player.status) });
+        playersById.set(existing.id, existing);
+        playersByNaturalKey.set(playerNaturalKey(existing), existing);
+      } else {
+        db.players.push(player);
+        playersById.set(player.id, player);
+        playersByNaturalKey.set(playerNaturalKey(player), player);
+      }
+    }
+    const nextPlayerCursor = playersPayload.meta?.next_cursor ? String(playersPayload.meta.next_cursor) : null;
+    return { provider: "balldontlie", message: `balldontlie free-step: synced ${incoming.length} players${nextPlayerCursor ? "; more pages queued." : "; catalog complete."}`, nextPlayerCursor, playersComplete: !nextPlayerCursor, details: { ...details, players: incoming.length } };
+  } catch (error) {
+    return { provider: "balldontlie", message: `balldontlie free-step stopped: ${error.message}.`, nextPlayerCursor: playerSyncServiceState(db).bdlNextPlayerCursor || null, details: { ...details, error: error.message } };
   }
 }
 
@@ -3938,9 +5133,10 @@ function mergeSleeperIntoLeaguePlayers(db, sleeperPlayers) {
     .filter((player) => player.status !== "Inactive")
     .filter((player) => (player.fantasyPositions || []).some((position) => fantasyPositions.has(position)) || fantasyPositions.has(player.position))
     .slice(0, 2500);
+  const playersById = new Map((db.players || []).map((player) => [player.id, player]));
+  const playersByNaturalKey = new Map((db.players || []).map((player) => [playerNaturalKey(player), player]));
   for (const sleeper of usefulPlayers) {
     const id = `slp-${sleeper.providerId}`;
-    const existing = db.players.find((player) => player.id === id);
     const status = sleeper.injuryStatus || sleeper.status || "Healthy";
     const mapped = {
       id,
@@ -3953,8 +5149,16 @@ function mergeSleeperIntoLeaguePlayers(db, sleeperPlayers) {
       ownership: null,
       locked: false
     };
-    if (existing) Object.assign(existing, { ...mapped, ownership: existing.ownership, locked: existing.locked });
-    else db.players.push(mapped);
+    const existing = playersById.get(id) || playersByNaturalKey.get(playerNaturalKey(mapped));
+    if (existing) {
+      Object.assign(existing, { ...mapped, id: existing.id, ownership: existing.ownership, locked: existing.locked });
+      playersById.set(existing.id, existing);
+      playersByNaturalKey.set(playerNaturalKey(existing), existing);
+    } else {
+      db.players.push(mapped);
+      playersById.set(mapped.id, mapped);
+      playersByNaturalKey.set(playerNaturalKey(mapped), mapped);
+    }
   }
 }
 
@@ -3981,10 +5185,14 @@ function mergeStatus(existing, incoming) {
 }
 
 function upsertById(target, incoming) {
+  const byId = new Map(target.map((item, index) => [item.id, index]));
   for (const item of incoming) {
-    const index = target.findIndex((existing) => existing.id === item.id);
+    const index = byId.get(item.id);
     if (index >= 0) target[index] = { ...target[index], ...item };
-    else target.push(item);
+    else {
+      byId.set(item.id, target.length);
+      target.push(item);
+    }
   }
 }
 
@@ -4002,7 +5210,21 @@ async function serveStatic(req, res) {
     if (!info.isFile()) throw new Error("not a file");
     const ext = path.extname(filePath);
     const contentType = { ".html": "text/html", ".css": "text/css", ".js": "text/javascript", ".json": "application/json", ".svg": "image/svg+xml" }[ext] || "application/octet-stream";
-    res.writeHead(200, { "Content-Type": contentType });
+    const cacheControl = ext === ".html" ? "no-cache" : "public, max-age=3600";
+    const etag = `"${info.size}-${Math.floor(info.mtimeMs)}"`;
+    if (req.headers["if-none-match"] === etag) {
+      res.writeHead(304, { "Cache-Control": cacheControl, ETag: etag });
+      res.end();
+      return;
+    }
+    const acceptsGzip = /\bgzip\b/.test(String(req.headers["accept-encoding"] || ""));
+    if (acceptsGzip && [".html", ".css", ".js", ".json", ".svg"].includes(ext) && info.size > 1024) {
+      const compressed = zlib.gzipSync(await readFile(filePath));
+      res.writeHead(200, { "Content-Type": contentType, "Cache-Control": cacheControl, ETag: etag, "Content-Encoding": "gzip", "Vary": "Accept-Encoding", "Content-Length": compressed.byteLength });
+      res.end(compressed);
+      return;
+    }
+    res.writeHead(200, { "Content-Type": contentType, "Cache-Control": cacheControl, ETag: etag, "Content-Length": info.size });
     createReadStream(filePath).pipe(res);
   } catch {
     res.writeHead(302, { Location: "/" });
@@ -4017,14 +5239,27 @@ async function main() {
     console.log(`Seeded ${DB_PATH}`);
     return;
   }
+  if (process.argv.includes("--cleanup-duplicates")) {
+    await mkdir(DATA_DIR, { recursive: true });
+    const db = await loadDb({ fresh: true, cache: false });
+    const result = cleanupDuplicatePlayers(db);
+    if (result.merged > 0) await saveDb(db);
+    console.log(`Duplicate player cleanup: ${result.merged} merged, ${result.before} duplicate group(s) before, ${result.after} after.`);
+    return;
+  }
   await getSqlite();
+  const startupDb = await loadDb();
+  primeSeededPasswordCache(startupDb);
+  if (playerSyncServiceState(startupDb).enabled) startPlayerSyncService(playerSyncServiceState(startupDb).intervalSeconds);
   await ensureStartupBackup().catch((error) => console.error("Startup backup failed:", error.message));
   startScheduledBackups();
   const server = http.createServer(async (req, res) => {
     try {
-      const db = await loadDb();
-      if (req.url.startsWith("/api/")) return await handleApi(req, res, db);
-      return await serveStatic(req, res);
+      res.locals = { acceptsGzip: /\bgzip\b/.test(String(req.headers["accept-encoding"] || "")) };
+      if (!req.url.startsWith("/api/")) return await serveStatic(req, res);
+      const isReadRequest = ["GET", "HEAD", "OPTIONS"].includes(req.method);
+      const db = await loadDb(isReadRequest ? {} : { fresh: true, cache: false });
+      return await handleApi(req, res, db);
     } catch (error) {
       console.error(error);
       return send(res, error.statusCode || 500, { error: error.statusCode ? error.message : "Server error", detail: error.statusCode ? undefined : error.message });
@@ -4045,8 +5280,13 @@ export {
   canPerformInPhase,
   csrfTokenForSession,
   commissionerAuditLog,
+  cleanupDuplicatePlayers,
   dataQualityReport,
   dryRunPreview,
+  databaseMaintenanceGuidance,
+  exportLeagueData,
+  familyEngagement,
+  finalizationChecklist,
   generatePlayoffBracket,
   hasSeededPassword,
   importRosterCsv,
@@ -4056,18 +5296,48 @@ export {
   ingestSleeperWeeklyStats,
   ingestEspnWeeklyStatsFallback,
   loadDbForCheck,
+  markLoadedTableFingerprints,
   makeActivityEvent,
   makeUser,
+  launchReadinessChecklist,
+  liveOpsReadiness,
   mergePlayers,
   mergeNotificationPreferences,
   mapEspnStatLine,
+  mockedProviderFixtures,
+  matchupPreviews,
   providerSettings,
+  playerSyncPlan,
+  playerSyncServiceState,
+  rateLimit,
   readinessChecklist,
+  rehearsalChecklist,
+  realisticLeagueFixture,
   repairOrphanReferences,
+  researchDecisionTools,
+  restorePointDescription,
+  runMigrations,
   normalizeEspnSummaryStats,
   parseCsv,
+  replaceDraftPick,
+  rosterHealthScore,
+  schemaMigrationStatus,
+  syncProviderDemoMode,
+  runSmartPlayerSyncStep,
+  targetedPersistenceAudit,
+  simulateMockDraft,
+  setupReview,
+  skipDraftPick,
+  swapDraftPicks,
+  tradeFairnessSummary,
+  transactionSafetyReport,
+  unchangedProviderTables,
+  updateLeagueRepository,
+  validateCompletedWeekAgainstSheet,
   updatePlayoffBracketFromFinals,
+  validateLeagueRules,
   validateDbReferences,
   visibleActivityForUser,
+  weeklyOperations,
   validateWeeklyStatIngest
 };

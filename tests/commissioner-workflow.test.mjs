@@ -1,14 +1,24 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  cleanupDuplicatePlayers,
   dataQualityReport,
   dryRunPreview,
   importManualWeeklyStats,
   initialDb,
+  launchReadinessChecklist,
+  liveOpsReadiness,
+  markLoadedTableFingerprints,
   mergePlayers,
+  playerSyncPlan,
+  playerSyncServiceState,
   providerSettings,
   readinessChecklist,
-  repairOrphanReferences
+  rehearsalChecklist,
+  repairOrphanReferences,
+  runSmartPlayerSyncStep,
+  setupReview,
+  unchangedProviderTables
 } from "../server.js";
 
 test("data quality report summarizes duplicates and invalid references", () => {
@@ -46,6 +56,19 @@ test("merge players rewrites lineup references and removes source", () => {
   assert.equal(db.lineups.t1.QB, "p1");
   assert.equal(db.players.some((player) => player.id === "source-player"), false);
   assert.equal(db.players.find((player) => player.id === "p1").projection, 99);
+});
+
+test("duplicate player cleanup keeps the rostered canonical player", () => {
+  const db = initialDb();
+  db.players.push({ ...db.players[0], id: "slp-duplicate", ownership: null, projection: 5 });
+  db.weeklyPlayerStats.push({ id: "stat-dup", appPlayerId: "slp-duplicate", season: 2026, week: 6, statType: "actual", fantasyPoints: 12 });
+
+  const result = cleanupDuplicatePlayers(db);
+
+  assert.equal(result.merged, 1);
+  assert.equal(result.after, 0);
+  assert.equal(db.players.some((player) => player.id === "slp-duplicate"), false);
+  assert.equal(db.weeklyPlayerStats.find((item) => item.id === "stat-dup").appPlayerId, "p1");
 });
 
 test("readiness checklist reflects phase-specific checks", () => {
@@ -103,5 +126,130 @@ test("provider settings have conservative defaults", () => {
 
   assert.equal(settings.refreshCadenceMinutes, 120);
   assert.equal(settings.scoringRefreshCadenceMinutes, 15);
+  assert.equal(settings.playerSyncIntervalSeconds, 13);
   assert.equal(settings.cacheSnapshots, true);
+});
+
+test("launch readiness checklist flags seeded passwords as blockers", () => {
+  const db = initialDb();
+
+  const readiness = launchReadinessChecklist(db);
+
+  assert.equal(readiness.ready, false);
+  assert.ok(readiness.summary.blockers >= 1);
+  assert.equal(readiness.checks.find((check) => check.id === "accounts").status, "blocker");
+  assert.equal(readiness.checks.find((check) => check.id === "accounts").target.view, "settings");
+});
+
+test("rehearsal setup and live ops readiness expose actionable pre-manual checks", () => {
+  const db = initialDb();
+  const rehearsal = rehearsalChecklist(db);
+  const setup = setupReview(db);
+  const live = liveOpsReadiness(db);
+
+  assert.ok(rehearsal.steps.some((step) => step.id === "scoring"));
+  assert.equal(setup.users.total, db.users.length);
+  assert.ok(Array.isArray(setup.impossible));
+  assert.ok(live.checks.some((check) => check.id === "schedule-window"));
+});
+
+test("smart player sync plans game-day stats and free-tier catalog paging", () => {
+  const db = initialDb();
+  const now = Date.parse("2026-10-04T18:00:00.000Z");
+  db.nflTeams = Array.from({ length: 32 }, (_, index) => ({ id: `team-${index}`, provider: "balldontlie", providerId: String(index), abbreviation: `T${index}` }));
+  db.nflGames = [{ id: "g-live", provider: "balldontlie", providerId: "1", season: 2026, week: db.meta.currentWeek, status: "in_progress", date: new Date(now - 30 * 60000).toISOString() }];
+  db.meta.playerSyncService = { enabled: true, intervalSeconds: 13, lastBdlAt: new Date(now - 14 * 1000).toISOString(), lastScoringAt: new Date(now - 120 * 1000).toISOString() };
+
+  const plan = playerSyncPlan(db, now);
+
+  assert.equal(playerSyncServiceState(db).enabled, true);
+  assert.equal(plan.schedule.mode, "live");
+  assert.ok(plan.actions.includes("balldontlie-catalog-page"));
+  assert.ok(plan.actions.includes("weekly-actual-stats"));
+  assert.equal(plan.freeRateLimits.balldontliePerMinute, 5);
+});
+
+test("smart player sync step imports a balldontlie player page when switch is on", async (t) => {
+  const db = initialDb();
+  const now = Date.parse("2026-10-05T12:00:00.000Z");
+  db.nflTeams = Array.from({ length: 32 }, (_, index) => ({ id: `team-${index}`, provider: "balldontlie", providerId: String(index), abbreviation: `T${index}` }));
+  db.nflGames = [{ id: "g1", provider: "balldontlie", providerId: "1", season: 2026, week: db.meta.currentWeek, status: "scheduled", date: new Date(now + 86400000).toISOString() }];
+  db.providerSync.nextPlayerCursor = "stale-provider-cursor";
+  db.providerPlayers = [{ provider: "sleeper", providerId: "cached", name: "Cached Player", team: "BUF", syncedAt: new Date(now).toISOString() }];
+  db.providerTrending = [{ id: "trend-cached", provider: "sleeper", providerId: "cached", trendType: "add", count: 1, syncedAt: new Date(now).toISOString() }];
+  db.meta.playerSyncService = { enabled: true, intervalSeconds: 13, lastBdlAt: new Date(now - 14000).toISOString(), lastSleeperPlayersAt: new Date(now).toISOString(), lastSleeperTrendingAt: new Date(now).toISOString() };
+  const originalFetch = global.fetch;
+  const originalKey = process.env.BALLDONTLIE_API_KEY;
+  process.env.BALLDONTLIE_API_KEY = "test-key";
+  t.after(() => {
+    global.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.BALLDONTLIE_API_KEY;
+    else process.env.BALLDONTLIE_API_KEY = originalKey;
+  });
+  global.fetch = async (url) => {
+    assert.ok(String(url).includes("/players?per_page=100"));
+    return {
+      ok: true,
+      json: async () => ({
+        data: [{ id: 987, first_name: "Switchy", last_name: "McPlayer", position_abbreviation: "WR", team: { abbreviation: "BUF" } }],
+        meta: { next_cursor: 988 }
+      })
+    };
+  };
+
+  const result = await runSmartPlayerSyncStep(db, { now });
+
+  assert.equal(result.runCount, 1);
+  assert.equal(result.bdlNextPlayerCursor, "988");
+  assert.ok(db.players.some((player) => player.id === "bdl-987" && player.name === "Switchy McPlayer"));
+});
+
+test("smart player sync clears the player cursor when catalog paging completes", async (t) => {
+  const db = initialDb();
+  const now = Date.parse("2026-10-05T12:00:00.000Z");
+  db.nflTeams = Array.from({ length: 32 }, (_, index) => ({ id: `team-${index}`, provider: "balldontlie", providerId: String(index), abbreviation: `T${index}` }));
+  db.nflGames = [{ id: "g1", provider: "balldontlie", providerId: "1", season: 2026, week: db.meta.currentWeek, status: "scheduled", date: new Date(now + 86400000).toISOString() }];
+  db.providerSync.nextPlayerCursor = "stale-provider-cursor";
+  db.providerPlayers = [{ provider: "sleeper", providerId: "cached", name: "Cached Player", team: "BUF", syncedAt: new Date(now).toISOString() }];
+  db.providerTrending = [{ id: "trend-cached", provider: "sleeper", providerId: "cached", trendType: "add", count: 1, syncedAt: new Date(now).toISOString() }];
+  db.meta.playerSyncService = { enabled: true, intervalSeconds: 13, bdlNextPlayerCursor: "last-page", lastBdlAt: new Date(now - 14000).toISOString(), lastSleeperPlayersAt: new Date(now).toISOString(), lastSleeperTrendingAt: new Date(now).toISOString() };
+  const originalFetch = global.fetch;
+  const originalKey = process.env.BALLDONTLIE_API_KEY;
+  process.env.BALLDONTLIE_API_KEY = "test-key";
+  t.after(() => {
+    global.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.BALLDONTLIE_API_KEY;
+    else process.env.BALLDONTLIE_API_KEY = originalKey;
+  });
+  global.fetch = async () => ({
+    ok: true,
+    json: async () => ({
+      data: [{ id: 988, first_name: "Final", last_name: "Page", position_abbreviation: "RB", team: { abbreviation: "DAL" } }],
+      meta: { next_cursor: null }
+    })
+  });
+
+  const result = await runSmartPlayerSyncStep(db, { now });
+
+  assert.equal(result.bdlNextPlayerCursor, null);
+  assert.ok(result.bdlPlayersCompleteAt);
+  assert.ok(db.players.some((player) => player.id === "bdl-988" && player.name === "Final Page"));
+});
+
+test("unchanged provider sync tables can be preserved during normal league saves", () => {
+  const db = initialDb();
+  db.providerPlayers = [{ id: "sleeper-1", provider: "sleeper", providerId: "1", name: "Cached Player", syncedAt: "2026-10-05T12:00:00.000Z" }];
+  db.providerTrending = [{ id: "trend-1", provider: "sleeper", providerId: "1", trendType: "add", count: 3, syncedAt: "2026-10-05T12:00:00.000Z" }];
+  db.nflTeams = [{ id: "team-1", provider: "balldontlie", providerId: "1", abbreviation: "BUF", syncedAt: "2026-10-05T12:00:00.000Z" }];
+  markLoadedTableFingerprints(db);
+
+  db.players[0].projection = 42;
+  const unchanged = unchangedProviderTables(db);
+
+  assert.ok(unchanged.has("provider_players"));
+  assert.ok(unchanged.has("provider_trending"));
+  assert.ok(unchanged.has("nfl_teams"));
+
+  db.providerTrending[0].count = 4;
+  assert.equal(unchangedProviderTables(db).has("provider_trending"), false);
 });

@@ -10,9 +10,13 @@
     "home": "powershell -ExecutionPolicy Bypass -File scripts/start-home.ps1",
     "seed": "node --no-warnings server.js --seed",
     "check": "node --check server.js && node --check public/app.js && npm test && node scripts/check-data.mjs",
-    "test": "node scripts/run-tests.mjs"
+    "test": "node scripts/run-tests.mjs",
+    "test:e2e": "playwright test"
   },
   "engines": {
     "node": ">=18"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.59.1"
   }
 }
