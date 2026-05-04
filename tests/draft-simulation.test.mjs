@@ -62,6 +62,10 @@ test("commissioner can skip and later replace an accidental draft pick", () => {
 
 test("commissioner can swap completed draft pick teams and ownership", () => {
   const db = initialDb();
+  db.users.push({ ...db.users[0], id: "u2", username: "manager2", displayName: "Manager Two", role: "manager" });
+  db.teams.push({ id: "t2", name: "Manager Two's Team", manager: "MT", ownerUserId: "u2", logoUrl: "", color: "#49a464", wins: 0, losses: 0, ties: 0, waiverRank: 2 });
+  db.lineups.t2 = {};
+  db.league.draft.order.push("t2");
   db.meta.seasonPhase = "draft";
   db.league.draft.status = "in_progress";
   db.league.draft.currentPick = 1;

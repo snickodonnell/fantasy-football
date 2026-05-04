@@ -10,6 +10,7 @@ import {
   liveOpsReadiness,
   markLoadedTableFingerprints,
   mergePlayers,
+  mergeSleeperIntoLeaguePlayers,
   playerSyncPlan,
   playerSyncServiceState,
   providerSettings,
@@ -56,6 +57,29 @@ test("merge players rewrites lineup references and removes source", () => {
   assert.equal(db.lineups.t1.QB, "p1");
   assert.equal(db.players.some((player) => player.id === "source-player"), false);
   assert.equal(db.players.find((player) => player.id === "p1").projection, 99);
+});
+
+test("Sleeper player merge keeps all team defenses outside the player cap", () => {
+  const db = initialDb();
+  const sleeperPlayers = Array.from({ length: 2600 }, (_, index) => ({
+    providerId: `player-${index}`,
+    name: `Depth Player ${index}`,
+    position: "WR",
+    fantasyPositions: ["WR"],
+    team: "FA",
+    status: "Active"
+  }));
+  sleeperPlayers.push(
+    { providerId: "BAL", name: "Baltimore Ravens", position: "DEF", fantasyPositions: ["DEF"], team: "BAL", status: "Active" },
+    { providerId: "ARI", name: "Arizona Cardinals", position: "DEF", fantasyPositions: ["DEF"], team: "ARI", status: "Active" }
+  );
+
+  mergeSleeperIntoLeaguePlayers(db, sleeperPlayers);
+
+  const defenses = db.players.filter((player) => player.position === "D/ST");
+  assert.ok(defenses.some((player) => player.id === "p35" && player.name === "Baltimore Ravens D/ST"));
+  assert.ok(defenses.some((player) => player.id === "slp-ARI" && player.name === "Arizona Cardinals D/ST"));
+  assert.equal(defenses.filter((player) => player.nflTeam === "BAL").length, 1);
 });
 
 test("duplicate player cleanup keeps the rostered canonical player", () => {

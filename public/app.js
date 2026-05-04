@@ -38,6 +38,10 @@ const state = {
   dialogResolve: null,
   toast: null,
   error: "",
+  catalogLoaded: false,
+  catalogLoading: false,
+  notificationsOpen: false,
+  setupTarget: "",
   index: {
     playersById: new Map(),
     teamsById: new Map(),
@@ -64,7 +68,12 @@ const nav = [
 ];
 
 const isCommissioner = () => ["admin", "commissioner"].includes(state.user?.role);
-const availableNav = () => nav.filter(([id]) => id !== "admin" || isCommissioner());
+const hasMatchups = () => Boolean(state.data?.matchups?.length);
+const availableNav = () => nav.filter(([id]) => {
+  if (id === "admin") return isCommissioner();
+  if (id === "matchups") return hasMatchups();
+  return true;
+});
 
 function applyTheme() {
   document.documentElement.dataset.theme = state.theme;
@@ -90,6 +99,8 @@ function routeHash(view = state.view, params = {}) {
 function applyRouteFromLocation() {
   const route = parseRoute(window.location.hash);
   state.view = route.view;
+  if (state.view === "admin" && !isCommissioner()) state.view = "dashboard";
+  if (state.view === "matchups" && !hasMatchups()) state.view = "dashboard";
   if (route.playerId) state.selectedPlayerId = route.playerId;
   if (route.view === "team") {
     state.teamTab = route.teamTab || "roster";
@@ -134,6 +145,10 @@ function setToast(message, tone = "success") {
   state.toast = message ? { message, tone } : null;
 }
 
+function escapeAttr(value = "") {
+  return String(value).replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
+}
+
 async function api(path, options = {}) {
   const response = await fetch(path, {
     headers: { "Content-Type": "application/json", ...(state.csrfToken && !["GET", undefined].includes(options.method) ? { "X-CSRF-Token": state.csrfToken } : {}), ...(options.headers || {}) },
@@ -155,6 +170,7 @@ async function bootstrap() {
   }
   if (state.user && !window.location.hash) navigate("dashboard", {}, true);
   else if (state.user) applyRouteFromLocation();
+  if (state.user && ["players", "draft", "player"].includes(state.view)) await ensurePlayerCatalog();
   render();
 }
 
@@ -177,7 +193,57 @@ function dataKey(...parts) {
 
 function setData(data) {
   state.data = data;
+  state.catalogLoaded = Boolean(data.catalog?.loadedAll);
   rebuildIndexes();
+  maybeConfirmSetupComplete();
+}
+
+function setupAckKey() {
+  return `ff-setup-complete-ack-${state.user?.id || "guest"}`;
+}
+
+function setupCompleteAcknowledged() {
+  return localStorage.getItem(setupAckKey()) === "true";
+}
+
+function shouldShowSetupWizard() {
+  const onboarding = state.data?.onboarding;
+  return Boolean(onboarding && (!onboarding.complete || !setupCompleteAcknowledged()));
+}
+
+function maybeConfirmSetupComplete() {
+  const onboarding = state.data?.onboarding;
+  if (!onboarding?.complete || setupCompleteAcknowledged() || state.dialog) return;
+  setTimeout(() => {
+    localStorage.setItem(setupAckKey(), "true");
+    state.dialog = { title: "Setup complete", message: "Nice. The setup checklist is complete, so it will stay out of your way now.", confirmLabel: "Done" };
+    state.dialogResolve = () => {};
+    render();
+  }, 0);
+}
+
+async function ensurePlayerCatalog() {
+  if (state.catalogLoaded || state.catalogLoading || !state.data) return;
+  state.catalogLoading = true;
+  try {
+    const pageSize = 250;
+    let page = 1;
+    let total = Infinity;
+    const players = [];
+    while (players.length < total) {
+      const result = await api(`/api/players/catalog?page=${page}&limit=${pageSize}`);
+      players.push(...(result.players || []));
+      total = result.total || players.length;
+      if (!(result.players || []).length) break;
+      page += 1;
+    }
+    state.data.players = players;
+    state.data.catalog = { ...(state.data.catalog || {}), total: players.length, returned: players.length, loadedAll: true };
+    state.catalogLoaded = true;
+    rebuildIndexes();
+  } finally {
+    state.catalogLoading = false;
+  }
 }
 
 function rebuildIndexes() {
@@ -268,6 +334,14 @@ function myTeam() {
   return state.data.myTeam;
 }
 
+function ownsTeam(item) {
+  return Boolean(item && item.ownerUserId === state.user?.id);
+}
+
+function canEditTeam(item) {
+  return isCommissioner() || ownsTeam(item);
+}
+
 function roster(teamId) {
   return state.index.rostersByTeam.get(teamId) || [];
 }
@@ -323,23 +397,13 @@ function layout(content) {
     <div class="app-shell">
       <aside class="side">
         <div class="brand"><div class="shield">◆</div><div><h1>FAMILY<br>FOOTBALL</h1><p>Local league command center</p></div></div>
-        <div class="system-title">Colors</div>
-        <div class="swatches">
-          <span class="swatch swatch-blue"></span><span class="swatch swatch-green"></span>
-          <span class="swatch swatch-slate"></span><span class="swatch swatch-red"></span>
-          <span class="swatch swatch-panel"></span><span class="swatch swatch-soft"></span>
-        </div>
-        <div class="system-title">League Tools</div>
-        <div class="icon-grid"><span>⌂</span><span>☷</span><span>◇</span><span>♜</span><span>＋</span><span>⚙</span></div>
-        <div class="system-title">Status</div>
-        <p class="hint">${state.data.providerSync.message}</p>
-        <p class="hint">${syncCounts()}</p>
+        ${leagueSidePanel()}
       </aside>
       <main class="main">
         <header class="topbar">
           <div class="brand brand-compact"><div class="shield shield-sm">◆</div></div>
           <nav class="tabs" aria-label="Primary navigation">${navItems.map(([id,, label]) => `<a class="tab ${state.view === id ? "active" : ""}" href="${routeHash(id)}" data-view="${id}" ${state.view === id ? 'aria-current="page"' : ""}>${label}</a>`).join("")}</nav>
-          <div class="user-pill">${phaseBadge()}<button class="icon theme-toggle" title="Toggle dark mode" data-action="theme-toggle" aria-label="Toggle dark mode">${state.theme === "dark" ? "☀" : "☾"}</button><button class="icon" title="Sync data" data-action="sync">↻</button><button class="notification-button" title="Mark updates read" data-action="mark-activity-read">●<span>${state.data.unreadActivityCount || 0}</span></button><span class="avatar">${initials(state.user.displayName)}</span><span>${state.user.displayName}</span><button class="ghost" data-action="logout">Sign out</button></div>
+          <div class="user-pill">${phaseBadge()}<button class="icon theme-toggle" title="Toggle dark mode" data-action="theme-toggle" aria-label="Toggle dark mode">${state.theme === "dark" ? "☀" : "☾"}</button><button class="icon" title="Sync data" data-action="sync">↻</button>${notificationCenter()}<span class="avatar">${initials(state.user.displayName)}</span><span>${state.user.displayName}</span><button class="ghost" data-action="logout">Sign out</button></div>
         </header>
         ${state.data.meta.setupRequired ? `<div class="setup-warning"><strong>Password setup required.</strong><span>Change the seeded password in Manager Settings before using league actions on the home network.</span><button data-view="settings">Go to Settings</button></div>` : ""}
         ${content}
@@ -349,6 +413,72 @@ function layout(content) {
       <nav class="mobile-nav" aria-label="Mobile navigation">${navItems.map(([id, icon, label]) => `<a class="${state.view === id ? "active" : ""}" href="${routeHash(id)}" data-view="${id}" ${state.view === id ? 'aria-current="page"' : ""}><span>${icon}</span>${label}</a>`).join("")}</nav>
     </div>
   `;
+}
+
+function leagueSidePanel() {
+  const activeTeam = myTeam();
+  const nextMatchup = (state.data.matchups || []).find((matchup) => [matchup.homeTeamId, matchup.awayTeamId].includes(activeTeam?.id));
+  const opponentId = nextMatchup ? (nextMatchup.homeTeamId === activeTeam.id ? nextMatchup.awayTeamId : nextMatchup.homeTeamId) : null;
+  const opponent = opponentId ? team(opponentId) : null;
+  const draft = state.data.league.draft || {};
+  const playerSync = state.data.ops?.playerSyncService || {};
+  return `
+    <div class="side-section">
+      <div class="system-title">My Team</div>
+      <div class="side-card">
+        <div class="team-preview">${teamAvatar(activeTeam)}<div><strong>${activeTeam?.name || "Team"}</strong><p class="hint">${roster(activeTeam?.id).length}/${state.data.league.settings.maxRosterSize || 15} roster spots</p></div></div>
+        <p class="between small"><span>Projection</span><strong>${projectionFor(activeTeam?.id)}</strong></p>
+        <p class="between small"><span>Waiver rank</span><strong>${activeTeam?.waiverRank || "-"}</strong></p>
+      </div>
+    </div>
+    <div class="side-section">
+      <div class="system-title">Quick Actions</div>
+      <div class="side-actions">
+        <button data-view="team">Set Lineup</button>
+        <button data-view="players">Find Players</button>
+        <button data-view="draft">Draft Room</button>
+        ${isCommissioner() ? `<button data-view="admin">Commissioner</button>` : ""}
+      </div>
+    </div>
+    <div class="side-section">
+      <div class="system-title">This Week</div>
+      <div class="side-card">
+        <p class="small"><strong>${opponent ? `${activeTeam.name} vs ${opponent.name}` : "No matchup selected"}</strong></p>
+        <p class="hint">${state.data.meta.phaseLabel} · Week ${state.data.meta.currentWeek}</p>
+        <p class="between small"><span>Draft</span><strong>${labelize(draft.status || "not_started")}</strong></p>
+        <p class="between small"><span>Sync</span><strong>${playerSync.enabled ? "On" : "Manual"}</strong></p>
+      </div>
+    </div>
+    <div class="side-section">
+      <div class="system-title">Provider Status</div>
+      <p class="hint">${state.data.providerSync.message}</p>
+      <p class="hint">${syncCounts()}</p>
+    </div>
+  `;
+}
+
+function notificationCenter() {
+  const unread = state.data.unreadActivityCount || 0;
+  return `<div class="notification-center">
+    <button class="notification-button ${unread ? "has-unread" : ""}" title="Notifications" aria-label="Notifications" data-action="toggle-notifications" aria-expanded="${state.notificationsOpen ? "true" : "false"}">●<span>${unread}</span></button>
+    ${state.notificationsOpen ? notificationFlyout() : ""}
+  </div>`;
+}
+
+function notificationFlyout() {
+  const items = (state.data.activity || []).slice(0, 12);
+  return `<div class="notification-flyout" role="region" aria-label="Notifications">
+    <div class="between"><h3>Notifications</h3><button class="ghost" data-action="mark-activity-read">Mark read</button></div>
+    ${items.length ? `<div class="notification-list">${items.map((event) => notificationItem(event)).join("")}</div>` : `<div class="empty">No notifications yet.</div>`}
+  </div>`;
+}
+
+function notificationItem(event) {
+  const target = event.playerId ? { view: "player", playerId: event.playerId } : event.teamId ? { view: "team", teamId: event.teamId } : { view: event.category === "commissioner" ? "admin" : "league" };
+  return `<a class="notification-item ${event.read ? "" : "unread"}" href="${routeHash(target.view, target)}" data-view="${target.view}" ${target.playerId ? `data-player="${target.playerId}"` : ""}>
+    <span class="activity-icon">${event.category?.slice(0, 2).toUpperCase() || "FF"}</span>
+    <span><strong>${event.title}</strong><small>${event.body || ""}</small><em>${moneyTime(event.createdAt)}</em></span>
+  </a>`;
 }
 
 function dialogMarkup() {
@@ -382,8 +512,18 @@ function phaseNotice(action, label) {
 function dashboard() {
   const data = state.data;
   const matchup = data.matchups.find((item) => item.homeTeamId === data.myTeam.id || item.awayTeamId === data.myTeam.id) || data.matchups[0];
-  const home = team(matchup.homeTeamId);
-  const away = team(matchup.awayTeamId);
+  const home = matchup ? team(matchup.homeTeamId) : null;
+  const away = matchup ? team(matchup.awayTeamId) : null;
+  const totalScore = matchup ? Number(matchup.homeScore || 0) + Number(matchup.awayScore || 0) : 0;
+  const setupCard = shouldShowSetupWizard() ? `<article class="card setup-card"><h3>Setup Wizard</h3>${onboardingPanel()}</article>` : "";
+  const matchupSnapshot = matchup && home && away ? `
+        <div class="score-row">
+          <div><span class="avatar">${home.manager}</span><strong> ${home.name}</strong><div class="score">${matchup.homeScore}</div><p class="small">Proj ${projectionFor(home.id)}</p></div>
+          <div class="vs">vs</div>
+          <div class="text-right"><strong>${away.name} </strong><span class="avatar">${away.manager}</span><div class="score">${matchup.awayScore}</div><p class="small">Proj ${projectionFor(away.id)}</p></div>
+        </div>
+        <div class="progress"><span style="--progress:${totalScore ? Math.min(100, matchup.homeScore / totalScore * 100) : 50}%"></span></div>
+        <a class="button-link ghost" href="${routeHash("matchups")}" data-view="matchups">View Full Matchup</a>` : `<div class="empty empty-left">No matchups yet. Create teams, draft, then generate or simulate the season schedule.</div>`;
   return layout(`
     <section class="page-head"><div><h2>Main Dashboard</h2><p>Overview of league, matchups, standings, and family activity.</p></div><button class="primary" data-view="team" ${actionAllowed("lineup") ? "" : "disabled"}>Make Lineup Moves</button></section>
     <section class="grid dashboard-grid">
@@ -395,19 +535,13 @@ function dashboard() {
     ${announcementPanel()}
     <section class="grid three-col section-gap">
       <article class="card"><h3>What Can I Do Now?</h3>${phaseGuidancePanel()}</article>
-      <article class="card"><h3>First Login Setup</h3>${onboardingPanel()}</article>
+      ${setupCard}
       <article class="card"><h3>Weekly Awards</h3>${awardsPanel()}</article>
     </section>
     <section class="grid two-col section-gap">
       <article class="card">
         <h3>Matchup Snapshot</h3>
-        <div class="score-row">
-          <div><span class="avatar">${home.manager}</span><strong> ${home.name}</strong><div class="score">${matchup.homeScore}</div><p class="small">Proj ${projectionFor(home.id)}</p></div>
-          <div class="vs">vs</div>
-          <div class="text-right"><strong>${away.name} </strong><span class="avatar">${away.manager}</span><div class="score">${matchup.awayScore}</div><p class="small">Proj ${projectionFor(away.id)}</p></div>
-        </div>
-        <div class="progress"><span style="--progress:${Math.min(100, matchup.homeScore / (matchup.homeScore + matchup.awayScore) * 100)}%"></span></div>
-        <a class="button-link ghost" href="${routeHash("matchups")}" data-view="matchups">View Full Matchup</a>
+        ${matchupSnapshot}
       </article>
       <article class="card">
         <h3>Recent Activity</h3>
@@ -442,7 +576,13 @@ function phaseGuidancePanel() {
 
 function onboardingPanel() {
   const onboarding = state.data.onboarding || {};
-  return `<div class="waiver-list">${(onboarding.steps || []).map((step) => `<div class="waiver-item"><span class="pill ${step.done ? "Healthy" : "Questionable"}">${step.done ? "Done" : "Next"}</span><p class="small">${step.label}</p></div>`).join("")}</div>`;
+  if (onboarding.complete && setupCompleteAcknowledged()) return "";
+  return `<div class="setup-compact">
+    <div class="between"><p class="small">${onboarding.complete ? "All setup tasks are complete." : "Finish only the items that still need attention."}</p><span class="pill ${onboarding.complete ? "Healthy" : "Questionable"}">${(onboarding.steps || []).filter((step) => step.done).length}/${(onboarding.steps || []).length}</span></div>
+    <div class="waiver-list">${(onboarding.steps || []).map((step) => `<button class="waiver-item setup-step ${step.done ? "done" : ""}" data-action="setup-jump" data-step="${step.id}">
+      <span class="pill ${step.done ? "Healthy" : "Questionable"}">${step.done ? "Done" : "Go"}</span><span class="small">${step.label}</span>
+    </button>`).join("")}</div>
+  </div>`;
 }
 
 function awardsPanel() {
@@ -523,25 +663,21 @@ function draftBoard(draft) {
 
 function teamView() {
   const activeTeam = myTeam();
+  const editable = canEditTeam(activeTeam);
+  const visibleTabs = editable ? [["roster","Roster"],["lineup","Lineup"],["projections","Projections"],["stats","Stats"]] : [["roster","Roster"],["projections","Projections"],["stats","Stats"]];
+  if (!editable && state.teamTab === "lineup") state.teamTab = "roster";
   const rows = lineupRows(activeTeam.id);
   const activeSlot = state.selectedSlot || rows.starters.find(([, key]) => key)?.[1];
   const teamPlayers = roster(activeTeam.id);
   return layout(`
-    <section class="page-head"><div><h2>My Team</h2><p>${activeTeam.name} (${activeTeam.wins}-${activeTeam.losses})</p></div><div class="toolbar"><select data-action="select-team">${state.data.teams.map((item) => `<option value="${item.id}" ${item.id === activeTeam.id ? "selected" : ""}>${item.name}</option>`).join("")}</select><button class="primary" data-action="save-lineup" ${actionAllowed("lineup") ? "" : "disabled"}>Save Lineup</button></div></section>
+    <section class="page-head"><div><h2>${editable ? "My Team" : "Team Roster"}</h2><p>${activeTeam.name} (${activeTeam.wins}-${activeTeam.losses})${editable ? "" : " · view only"}</p></div><div class="toolbar"><div class="team-switcher">${state.data.teams.map((item) => `<button class="${item.id === activeTeam.id ? "active" : ""}" data-action="team-switch" data-team="${item.id}">${teamAvatar(item, 24)} ${item.name}</button>`).join("")}</div>${editable ? `<button class="primary" data-action="save-lineup" ${actionAllowed("lineup") ? "" : "disabled"}>Save Lineup</button>` : ""}</div></section>
     ${phaseNotice("lineup", "lineup")}
-    ${subtabBar("team", state.teamTab, [["roster","Roster"],["lineup","Lineup"],["projections","Projections"],["stats","Stats"]])}
+    ${subtabBar("team", state.teamTab, visibleTabs)}
     ${state.teamTab === "roster" ? `
       <section class="grid two-col">
         <article class="card"><h3>Roster</h3>${benchTable(teamPlayers)}</article>
         <aside class="card bench-card">
-        <h3>Team Identity</h3>
-        <form class="form-grid" data-form="team-settings" data-team="${activeTeam.id}">
-          <input name="name" value="${activeTeam.name}" placeholder="Team name">
-          <input name="manager" value="${activeTeam.manager}" placeholder="Initials">
-          <input name="logoUrl" value="${activeTeam.logoUrl || ""}" placeholder="Logo URL">
-          <input name="color" type="color" value="${activeTeam.color || "#4f7ee8"}">
-          <button>Save Team</button>
-        </form>
+        ${editable ? `<h3>Team Identity</h3>${teamSettingsForm(activeTeam)}` : `<h3>View Only</h3><div class="empty empty-left">Managers can view other rosters, but only commissioners can edit another team's information.</div>`}
         <h3 class="stack-heading">Player Status</h3>${statusSummary(roster(activeTeam.id))}
         </aside>
       </section>
@@ -555,6 +691,19 @@ function teamView() {
     ${state.teamTab === "projections" ? `<section class="card"><h3>Projections</h3>${projectionTable(teamPlayers)}</section>` : ""}
     ${state.teamTab === "stats" ? `<section class="card"><h3>Weekly Stats</h3>${teamStatsTable(teamPlayers)}</section>` : ""}
   `);
+}
+
+function teamSettingsForm(item, compact = false) {
+  return `<form class="form-grid team-edit" data-form="team-settings" data-team="${item.id}" data-setup-section="team">
+    ${teamAvatar(item, compact ? 32 : 52)}
+    <input name="name" value="${escapeAttr(item.name)}" placeholder="Team name">
+    <input name="manager" value="${escapeAttr(item.manager)}" placeholder="Initials">
+    <input name="logoUrl" type="hidden" value="${escapeAttr(item.logoUrl || "")}">
+    <input name="logoUpload" type="hidden" value="">
+    <label><span class="small">Logo Image</span><input name="logoFile" type="file" accept="image/png,image/jpeg,image/webp,image/gif" data-action="logo-upload"></label>
+    <input name="color" type="color" value="${escapeAttr(item.color || "#4f7ee8")}">
+    <button>Save Team</button>
+  </form>`;
 }
 
 function projectionTable(players) {
@@ -599,7 +748,100 @@ function statusSummary(players) {
   return ["Healthy", "Questionable", "Out"].map((status) => `<p class="between small"><span><span class="status-dot ${status}"></span> ${status}</span><strong>${counts[status] || 0} Players</strong></p>`).join("");
 }
 
+function pickerItems(source = "") {
+  if (source === "teams") return (state.data.teams || []).map((item) => ({ value: item.id, label: item.name, meta: item.manager || "" }));
+  if (source === "availablePlayers") return state.index.availablePlayers.map(playerPickerItem);
+  if (source === "rosteredPlayers") return state.index.rosteredPlayers.map(playerPickerItem);
+  if (source === "allPlayers") return (state.data.players || []).map(playerPickerItem);
+  if (source.startsWith("roster:")) return roster(source.replace("roster:", "")).map(playerPickerItem);
+  if (source.startsWith("otherTeams:")) {
+    const activeTeamId = source.replace("otherTeams:", "");
+    return (state.data.teams || []).filter((item) => item.id !== activeTeamId).map((item) => ({ value: item.id, label: item.name, meta: item.manager || "" }));
+  }
+  if (source.startsWith("tradeTargets:")) {
+    const activeTeamId = source.replace("tradeTargets:", "");
+    return state.index.rosteredPlayers.filter((p) => p.ownership !== activeTeamId).map((p) => ({ ...playerPickerItem(p), meta: `${p.position} · ${team(p.ownership)?.name || p.nflTeam}` }));
+  }
+  return [];
+}
+
+function playerPickerItem(p) {
+  return { value: p.id, label: p.name, meta: `${p.position} · ${p.nflTeam}${p.ownership ? ` · ${team(p.ownership)?.name || "Rostered"}` : ""}` };
+}
+
+function smartPicker(name, source, options = {}) {
+  const selected = [...new Set(options.selected || [])].filter((value) => value !== undefined && value !== null && value !== "");
+  const multiple = Boolean(options.multiple);
+  const label = options.label ? `<span class="picker-label">${options.label}</span>` : "";
+  const values = multiple
+    ? selected.map((value) => `<input type="hidden" name="${name}" value="${escapeAttr(value)}">`).join("")
+    : `<input type="hidden" name="${name}" value="${escapeAttr(selected[0] || "")}">`;
+  return `<div class="smart-picker" data-picker-source="${source}" data-picker-name="${name}" data-picker-multiple="${multiple ? "true" : "false"}">
+    ${label}
+    <div class="picker-values">${values}</div>
+    <input class="picker-search" type="search" placeholder="${escapeAttr(options.placeholder || "Search")}" autocomplete="off" data-action="picker-search">
+    <div class="picker-chips">${pickerChips(source, selected, multiple)}</div>
+    <div class="picker-results"></div>
+  </div>`;
+}
+
+function pickerChips(source, selected, multiple) {
+  if (!selected.length) return `<span class="picker-empty">${multiple ? "Nothing selected" : "No selection"}</span>`;
+  return selected.map((value) => {
+    const item = resolvePickerItem(source, value);
+    return `<span class="picker-chip">${item?.label || value}${multiple ? `<button type="button" data-action="picker-remove" data-value="${escapeAttr(value)}" aria-label="Remove ${escapeAttr(item?.label || value)}">×</button>` : ""}</span>`;
+  }).join("");
+}
+
+function resolvePickerItem(source, value) {
+  return pickerItems(source).find((item) => item.value === value) || (player(value) ? playerPickerItem(player(value)) : team(value) ? { value, label: team(value).name, meta: team(value).manager } : null);
+}
+
+function hydratePickers() {
+  document.querySelectorAll(".smart-picker").forEach((picker) => renderPickerOptions(picker));
+}
+
+function pickerValues(picker) {
+  return Array.from(picker.querySelectorAll(".picker-values input")).map((input) => input.value).filter(Boolean);
+}
+
+function renderPickerOptions(picker) {
+  const source = picker.dataset.pickerSource || "";
+  const query = picker.querySelector(".picker-search")?.value.trim().toLowerCase() || "";
+  const selected = new Set(pickerValues(picker));
+  const rows = pickerItems(source)
+    .filter((item) => !query || `${item.label} ${item.meta}`.toLowerCase().includes(query))
+    .slice(0, 14);
+  const target = picker.querySelector(".picker-results");
+  if (!target) return;
+  target.innerHTML = rows.length
+    ? rows.map((item) => `<button type="button" class="${selected.has(item.value) ? "selected" : ""}" data-action="picker-option" data-value="${escapeAttr(item.value)}"><strong>${item.label}</strong><span>${item.meta || ""}</span></button>`).join("")
+    : `<div class="empty picker-empty-result">No matches.</div>`;
+}
+
+function syncPickerSelection(picker, nextValues) {
+  const source = picker.dataset.pickerSource || "";
+  const name = picker.dataset.pickerName || "";
+  const multiple = picker.dataset.pickerMultiple === "true";
+  const values = [...new Set(nextValues)].filter(Boolean);
+  picker.querySelector(".picker-values").innerHTML = multiple
+    ? values.map((value) => `<input type="hidden" name="${name}" value="${escapeAttr(value)}">`).join("")
+    : `<input type="hidden" name="${name}" value="${escapeAttr(values[0] || "")}">`;
+  picker.querySelector(".picker-chips").innerHTML = pickerChips(source, values, multiple);
+  renderPickerOptions(picker);
+}
+
+function positionControl(view = state.view) {
+  const positions = ["ALL","QB","RB","WR","TE","FLEX","D/ST","K"];
+  return `<div class="segmented position-control">${positions.map((position) => `<a class="${state.position === position ? "active" : ""}" href="${routeHash(view, { position })}" data-action="position-chip" data-position="${position}">${position}</a>`).join("")}</div>`;
+}
+
+function segmentedField(name, options, selected) {
+  return `<div class="segmented-field">${options.map(([value, label]) => `<label class="${String(selected) === String(value) ? "active" : ""}"><input type="radio" name="${name}" value="${escapeAttr(value)}" ${String(selected) === String(value) ? "checked" : ""}>${label}</label>`).join("")}</div>`;
+}
+
 function playerDetailView() {
+  if (!state.catalogLoaded) return layout(`<section class="page-head"><div><h2>Player</h2><p>Loading player details...</p></div></section>`);
   const p = player(state.selectedPlayerId) || state.data.players[0];
   if (!p) return layout(`<section class="page-head"><div><h2>Player</h2><p>No player selected.</p></div></section>`);
   const owner = p.ownership ? team(p.ownership) : null;
@@ -736,6 +978,10 @@ function formatDate(value) {
 }
 
 function matchupsView() {
+  if (!state.data.matchups.length) return layout(`
+    <section class="page-head"><div><h2>Matchups</h2><p>No fantasy schedule has been created yet.</p></div></section>
+    <section class="card section-gap"><div class="empty empty-left">Matchups will appear after teams are created, the draft is complete, and a schedule is generated or the season sim is prepared.</div><div class="toolbar section-gap-sm">${isCommissioner() ? `<button data-view="admin">Go to Commissioner</button>` : `<button data-view="dashboard">Back to Dashboard</button>`}</div></section>
+  `);
   const matchup = state.data.matchups[0];
   const home = team(matchup.homeTeamId);
   const away = team(matchup.awayTeamId);
@@ -816,6 +1062,7 @@ function playoffGame(game) {
 }
 
 function draftView() {
+  if (!state.catalogLoaded) return layout(`<section class="page-head"><div><h2>Draft Room</h2><p>Loading the draft player pool...</p></div></section><section class="card section-gap"><div class="empty">Opening the full synced catalog for draft search.</div></section>`);
   const draft = state.data.league.draft;
   const currentTeamId = currentDraftTeamId(draft);
   const currentTeam = team(currentTeamId);
@@ -856,7 +1103,7 @@ function draftView() {
     ${isCommissioner() && state.draftSimulation ? draftSimulationPanel(state.draftSimulation) : ""}
     <section class="grid two-col section-gap">
       <article class="card">
-        <div class="toolbar"><input placeholder="Search draft board" value="${state.filter}" data-action="filter"><select data-action="position"><option>ALL</option>${["QB","RB","WR","TE","FLEX","D/ST","K"].map((p) => `<option ${state.position === p ? "selected" : ""}>${p}</option>`).join("")}</select></div>
+        <div class="toolbar"><input placeholder="Search draft board" value="${escapeAttr(state.filter)}" data-action="filter" data-focus-key="filter">${positionControl("draft")}</div>
         <h3>Available Players</h3>
         <table><thead><tr><th>Pos</th><th>Player</th><th>Team</th><th>Status</th><th>Proj</th><th></th></tr></thead><tbody>${available.map((p) => `<tr><td>${p.position}</td><td>${playerLink(p.id, p.name)}</td><td>${p.nflTeam}</td><td>${statusPill(p.status)}</td><td>${p.projection}</td><td><div class="toolbar">${canManageDraftQueue(activeTeam.id) ? `<button data-action="draft-queue-add" data-player="${p.id}" data-team="${activeTeam.id}">Queue</button>` : ""}${isCommissioner() ? `<button data-action="draft-pick" data-player="${p.id}">Draft</button>` : ""}</div></td></tr>`).join("")}</tbody></table>
       </article>
@@ -901,18 +1148,15 @@ function draftRecoveryStatus(draft) {
 
 function draftOverrideTools(draft) {
   const completed = (draft.picks || []).filter((pick) => pick.pickNumber);
-  const available = state.index.availablePlayers.slice(0, 250);
-  const pickOptions = completed.map((pick) => `<option value="${pick.pickNumber}">${pick.pickNumber}. ${team(pick.teamId)?.name || pick.teamId} - ${pick.playerName || "Skipped"}</option>`).join("");
-  const playerOptions = available.map((p) => `<option value="${p.id}">${p.name} (${p.position}, ${p.nflTeam})</option>`).join("");
   return `<div class="override-grid">
-    <form class="toolbar" data-form="draft-replace-pick">
-      <select name="pickNumber">${pickOptions}</select>
-      <select name="playerId">${playerOptions}</select>
+    <form class="form-grid" data-form="draft-replace-pick">
+      <input name="pickNumber" type="number" min="1" max="${completed.length || 1}" placeholder="Pick number">
+      ${smartPicker("playerId", "availablePlayers", { label: "Replacement player", placeholder: "Search available players" })}
       <button>Replace Pick</button>
     </form>
-    <form class="toolbar" data-form="draft-swap-picks">
-      <select name="firstPickNumber">${pickOptions}</select>
-      <select name="secondPickNumber">${pickOptions}</select>
+    <form class="form-grid" data-form="draft-swap-picks">
+      <input name="firstPickNumber" type="number" min="1" max="${completed.length || 1}" placeholder="First pick number">
+      <input name="secondPickNumber" type="number" min="1" max="${completed.length || 1}" placeholder="Second pick number">
       <button>Swap Picks</button>
     </form>
     <p class="small">Skip is next to Autopick on the clock. Replacements use available players and keep the original pick team.</p>
@@ -967,12 +1211,8 @@ function draftConfigForm(draft) {
     <div class="settings-grid">
       <label><span>Rounds</span><input name="rounds" type="number" min="1" value="${draft.rounds || 15}"></label>
       <label><span>Pick Timer Seconds</span><input name="pickTimeSeconds" type="number" min="10" value="${draft.pickTimeSeconds || 60}"></label>
-      <label><span>Draft Style</span><select name="orderStyle">
-        <option value="snake" ${draft.orderStyle === "snake" ? "selected" : ""}>Snake</option>
-        <option value="linear" ${draft.orderStyle === "linear" ? "selected" : ""}>Linear</option>
-        <option value="third_round_reversal" ${draft.orderStyle === "third_round_reversal" ? "selected" : ""}>Third-round reversal</option>
-      </select></label>
-      ${order.map((teamId, index) => `<label><span>Pick Slot ${index + 1}</span><select name="order_${index}">${state.data.teams.map((item) => `<option value="${item.id}" ${item.id === teamId ? "selected" : ""}>${item.name}</option>`).join("")}</select></label>`).join("")}
+      <label><span>Draft Style</span>${segmentedField("orderStyle", [["snake","Snake"],["linear","Linear"],["third_round_reversal","Third-round reversal"]], draft.orderStyle || "snake")}</label>
+      ${order.map((teamId, index) => smartPicker(`order_${index}`, "teams", { label: `Pick Slot ${index + 1}`, selected: [teamId], placeholder: "Search teams" })).join("")}
     </div>
     <p class="small">Duplicate slots are ignored and any missing teams are appended when saved.</p>
     <button>Save Draft Setup</button>
@@ -982,8 +1222,8 @@ function draftConfigForm(draft) {
 function keeperTools(draft) {
   const keepers = draft.keepers || [];
   return `<form class="toolbar" data-form="draft-keeper">
-    <select name="teamId">${state.data.teams.map((item) => `<option value="${item.id}">${item.name}</option>`).join("")}</select>
-    <select name="playerId">${state.index.rosteredPlayers.map((p) => `<option value="${p.id}">${p.name} (${team(p.ownership)?.name || "Rostered"})</option>`).join("")}</select>
+    ${smartPicker("teamId", "teams", { selected: [state.data.teams[0]?.id], placeholder: "Search teams" })}
+    ${smartPicker("playerId", "rosteredPlayers", { placeholder: "Search rostered players" })}
     <input class="input-xs" name="round" type="number" min="1" value="1">
     <input name="note" placeholder="Keeper note">
     <button>Add Keeper</button>
@@ -1003,6 +1243,7 @@ function draftChat(draft) {
 }
 
 function playersView() {
+  if (!state.catalogLoaded) return layout(`<section class="page-head"><div><h2>Players</h2><p>Loading the player catalog...</p></div></section><section class="card section-gap"><div class="empty">Opening the full synced catalog. Dashboard loads stay lean; player-heavy screens load this only when needed.</div></section>`);
   const activeTeam = myTeam();
   const activeRoster = roster(activeTeam.id);
   const pageSize = 50;
@@ -1014,26 +1255,28 @@ function playersView() {
   const maxPage = Math.max(1, Math.ceil(filtered.length / pageSize));
   state.playersPage = Math.min(state.playersPage, maxPage);
   const pageItems = filtered.slice((state.playersPage - 1) * pageSize, state.playersPage * pageSize);
+  const matchupUseful = hasMatchups() && state.data.meta.seasonPhase !== "preseason";
+  const waiverUseful = actionAllowed("waiver") && hasMatchups() && activeRoster.length > 0;
   return layout(`
     <section class="page-head"><div><h2>Players</h2><p>Search free agents, add players, submit waiver claims, and start trades.</p></div></section>
-    <div class="toolbar"><input placeholder="Search players" value="${state.filter}" data-action="filter"><select data-action="position"><option>ALL</option>${["QB","RB","WR","TE","FLEX","D/ST","K"].map((p) => `<option ${state.position === p ? "selected" : ""}>${p}</option>`).join("")}</select><button data-action="sync">Sync Provider</button></div>
+    <div class="toolbar"><input placeholder="Search players" value="${escapeAttr(state.filter)}" data-action="filter" data-focus-key="filter">${positionControl("players")}<button data-action="sync">Sync Provider</button></div>
     <section class="grid three-col section-gap">
       <article class="card"><h3>Roster Health</h3>${rosterHealthPanel()}</article>
       <article class="card"><h3>Start / Sit</h3>${startSitPanel()}</article>
-      <article class="card"><h3>Matchup & Bye View</h3>${matchupStrengthPanel()}</article>
+      ${matchupUseful ? `<article class="card"><h3>Matchup & Bye View</h3>${matchupStrengthPanel()}</article>` : `<article class="card"><h3>Schedule Context</h3><div class="empty empty-left">Matchup and bye-week tools will appear after the draft and schedule are ready.</div></article>`}
     </section>
     <section class="grid two-col">
       <article class="card"><div class="between"><h3>Player Pool</h3>${pager(filtered.length, state.playersPage, pageSize, "players-page")}</div><table><thead><tr><th>Pos</th><th>Player</th><th>Team</th><th>Status</th><th>Proj</th><th></th></tr></thead><tbody>${pageItems.map((p) => `<tr><td>${p.position}</td><td>${playerLink(p.id, p.name)}</td><td>${p.nflTeam}</td><td>${statusPill(p.status)}</td><td>${p.projection}</td><td>${playerAction(p, activeTeam)}</td></tr>`).join("")}</tbody></table>${pager(filtered.length, state.playersPage, pageSize, "players-page")}</article>
       <aside class="card">
-        <h3>Submit Waiver Claim</h3>
+        ${waiverUseful ? `<h3>Submit Waiver Claim</h3>
         <form class="form-grid" data-form="waiver-claim">
           <input name="teamId" type="hidden" value="${activeTeam.id}">
-          <select name="addPlayerId">${state.index.availablePlayers.slice(0, 300).map((p) => `<option value="${p.id}">${p.name} (${p.position} ${p.nflTeam})</option>`).join("")}</select>
-          <select name="dropPlayerId"><option value="">No drop</option>${activeRoster.map((p) => `<option value="${p.id}">${p.name} (${p.position})</option>`).join("")}</select>
-          <button ${actionAllowed("waiver") ? "" : "disabled"}>Submit Claim</button>
+          ${smartPicker("addPlayerId", "availablePlayers", { label: "Add player", placeholder: "Search available players" })}
+          ${smartPicker("dropPlayerId", `roster:${activeTeam.id}`, { label: "Drop player", placeholder: "Search your roster" })}
+          <button>Submit Claim</button>
         </form>
-        ${phaseNotice("waiver", "waiver")}
-        <h3 class="stack-heading">Waivers</h3>${waiverDashboard(activeTeam)}
+        <h3 class="stack-heading">Waivers</h3>` : `<h3>Waivers</h3><div class="empty empty-left">Waiver claims will unlock once the league has drafted rosters and the season schedule exists.</div>`}
+        ${waiverDashboard(activeTeam)}
         <h3 class="stack-heading">Propose Trade</h3>${tradeForm(activeTeam)}
         ${state.tradeCompareIds.length ? `<h3 class="stack-heading">Compare Offer</h3>${playerComparison(state.tradeCompareIds)}` : ""}
         <h3 class="stack-heading">Trade Block</h3>${tradeBlockList(activeTeam)}
@@ -1123,9 +1366,8 @@ function waiverClaimItem(claim, index, options = {}) {
 }
 
 function waiverEditForm(claim) {
-  const claimRoster = roster(claim.teamId);
   return `<form class="toolbar waiver-edit-form" data-form="waiver-edit" data-claim="${claim.id}">
-    <select name="dropPlayerId"><option value="">No drop</option>${claimRoster.map((p) => `<option value="${p.id}" ${claim.dropPlayerId === p.id ? "selected" : ""}>${p.name} (${p.position})</option>`).join("")}</select>
+    ${smartPicker("dropPlayerId", `roster:${claim.teamId}`, { selected: claim.dropPlayerId ? [claim.dropPlayerId] : [], placeholder: "Search drop candidate" })}
     <button>Save</button>
   </form>`;
 }
@@ -1174,9 +1416,9 @@ function tradeForm(activeTeam) {
   const compareIds = `data-compare-form="trade-offer"`;
   return `<form class="form-grid" data-form="trade-offer">
     <input name="fromTeamId" type="hidden" value="${activeTeam.id}">
-    <label><span class="small">To Team</span><select name="toTeamId">${otherTeams.map((item) => `<option value="${item.id}" ${selectedToTeam === item.id ? "selected" : ""}>${item.name}</option>`).join("")}</select></label>
-    <label><span class="small">Offer</span><select name="offeredPlayerIds" multiple size="5" ${compareIds}>${myRoster.map((p) => `<option value="${p.id}">${p.name} (${p.position})</option>`).join("")}</select></label>
-    <label><span class="small">Request</span><select name="requestedPlayerIds" multiple size="5" ${compareIds}>${otherTeams.map((other) => `<optgroup label="${other.name}">${roster(other.id).map((p) => `<option value="${p.id}" data-team="${other.id}" ${state.tradeRequestedIds.includes(p.id) ? "selected" : ""}>${p.name} (${p.position})</option>`).join("")}</optgroup>`).join("")}</select></label>
+    ${smartPicker("toTeamId", `otherTeams:${activeTeam.id}`, { label: "To team", selected: [selectedToTeam], placeholder: "Search teams" })}
+    ${smartPicker("offeredPlayerIds", `roster:${activeTeam.id}`, { label: "Offer", multiple: true, placeholder: "Search your roster" })}
+    ${smartPicker("requestedPlayerIds", `roster:${selectedToTeam}`, { label: "Request", multiple: true, selected: state.tradeRequestedIds, placeholder: "Search their roster" })}
     <input name="message" placeholder="Message">
     <div class="toolbar"><button>Send Offer</button><button type="button" data-action="compare-trade-form">Compare</button></div>
   </form>`;
@@ -1226,8 +1468,8 @@ function counterTradeForm(trade) {
   return `<form class="form-grid counter-form" data-form="trade-counter" data-trade="${trade.id}">
     <input name="fromTeamId" type="hidden" value="${fromTeamId}">
     <input name="toTeamId" type="hidden" value="${toTeamId}">
-    <label><span class="small">Offer from ${team(fromTeamId)?.name}</span><select name="offeredPlayerIds" multiple size="4">${roster(fromTeamId).map((p) => `<option value="${p.id}">${p.name} (${p.position})</option>`).join("")}</select></label>
-    <label><span class="small">Request from ${team(toTeamId)?.name}</span><select name="requestedPlayerIds" multiple size="4">${roster(toTeamId).map((p) => `<option value="${p.id}">${p.name} (${p.position})</option>`).join("")}</select></label>
+    ${smartPicker("offeredPlayerIds", `roster:${fromTeamId}`, { label: `Offer from ${team(fromTeamId)?.name}`, multiple: true, placeholder: "Search roster" })}
+    ${smartPicker("requestedPlayerIds", `roster:${toTeamId}`, { label: `Request from ${team(toTeamId)?.name}`, multiple: true, placeholder: "Search roster" })}
     <input name="message" placeholder="Counter message" value="Counteroffer">
     <button>Send Counter</button>
   </form>`;
@@ -1279,7 +1521,7 @@ function adminView() {
     <section class="card section-gap">
       <h3>Season Control</h3>
       <form class="toolbar" data-form="season-phase">
-        <select name="phase">${["preseason","draft","regular_season","playoffs","offseason"].map((phase) => `<option value="${phase}" ${state.data.meta.seasonPhase === phase ? "selected" : ""}>${labelize(phase)}</option>`).join("")}</select>
+        ${segmentedField("phase", [["preseason","Preseason"],["draft","Draft"],["regular_season","Regular"],["playoffs","Playoffs"],["offseason","Offseason"]], state.data.meta.seasonPhase)}
         <button>Set Phase</button>
         <span class="small">Current phase: <strong>${state.data.meta.phaseLabel}</strong></span>
       </form>
@@ -1295,15 +1537,15 @@ function adminView() {
           <input name="displayName" placeholder="Display name">
           <input name="username" placeholder="Username">
           <input name="password" placeholder="Temporary password" type="password">
-          <select name="role"><option value="manager">Manager</option><option value="commissioner">Commissioner</option></select>
-          <select name="teamId"><option value="">No team</option>${state.data.teams.map((item) => `<option value="${item.id}">${item.name}</option>`).join("")}</select>
+          ${segmentedField("role", [["manager","Manager"],["commissioner","Commissioner"]], "manager")}
+          ${smartPicker("teamId", "teams", { label: "Team", placeholder: "Search teams" })}
           <button class="primary">Create Account</button>
         </form>
       </article>
     </section>
     <section class="card section-gap">
       <h3>Teams</h3>
-      <div class="team-edit-grid">${state.data.teams.map((item) => `<form class="form-grid team-edit" data-form="team-settings" data-team="${item.id}">${teamAvatar(item)}<input name="name" value="${item.name}"><input name="manager" value="${item.manager}"><input name="logoUrl" value="${item.logoUrl || ""}" placeholder="Logo URL"><input name="color" type="color" value="${item.color || "#4f7ee8"}"><button>Save</button></form>`).join("")}</div>
+      <div class="team-edit-grid">${state.data.teams.map((item) => teamSettingsForm(item, true)).join("")}</div>
     </section>`,
     data: `
     <section class="card section-gap">
@@ -1319,12 +1561,16 @@ function adminView() {
       <p class="small">CSV import accepts columns like team, player, playerId, round, and pick. Team and player values can be names or IDs.</p>
       ${backupRestorePanel(state.systemHealth)}
       <form class="form-grid" data-form="csv-import">
-        <select name="mode"><option value="rosters">Roster assignments</option><option value="draft">Draft results</option></select>
+        ${segmentedField("mode", [["rosters","Roster assignments"],["draft","Draft results"]], "rosters")}
         <textarea name="csv" placeholder="team,player&#10;The Andersons,Josh Allen&#10;The Parkers,Christian McCaffrey"></textarea>
         <div class="toolbar"><button type="button" data-action="dry-run-import">Preview Import</button><button>Import CSV</button></div>
       </form>
     </section>`,
     operations: `
+    <section class="card section-gap">
+      <div class="between"><h3>Season Sim Lab</h3><span class="pill">${state.data.ops?.seasonSim?.sourceSeason || 2025} replay</span></div>
+      ${seasonSimPanel(state.data.ops?.seasonSim)}
+    </section>
     <section class="card section-gap">
       <h3>Scoring Operations</h3>
       <p class="small">Ingest weekly stats/projections, process matchup scores, lock started players, finalize standings, and apply manual corrections.</p>
@@ -1342,8 +1588,8 @@ function adminView() {
       </div>
       <form class="settings-form" data-form="correction">
         <div class="settings-grid">
-          <label><span>Team</span><select name="teamId"><option value="">No team</option>${state.data.teams.map((item) => `<option value="${item.id}">${item.name}</option>`).join("")}</select></label>
-          <label><span>Player</span><select name="playerId"><option value="">Team-only correction</option>${state.index.rosteredPlayers.slice(0, 350).map((p) => `<option value="${p.id}">${p.name} (${team(p.ownership)?.name || "FA"})</option>`).join("")}</select></label>
+          ${smartPicker("teamId", "teams", { label: "Team", placeholder: "Search teams" })}
+          ${smartPicker("playerId", "rosteredPlayers", { label: "Player", placeholder: "Search rostered players" })}
           ${field("pointsDelta", "Point Delta", 0, "number", "0.01")}
           ${field("note", "Correction Note", "")}
         </div>
@@ -1396,13 +1642,12 @@ function adminView() {
           <h3>General</h3>
           <div class="settings-grid">
             ${field("name", "League Name", league.name)}
-            ${field("season", "Season", state.data.meta.season, "number")}
-            ${field("currentWeek", "Current Week", state.data.meta.currentWeek, "number")}
-            ${field("scoringType", "Scoring Type", league.settings.scoringType)}
-            ${field("maxTeams", "Max Teams", league.settings.maxTeams, "number")}
-            ${field("maxRosterSize", "Max Roster Size", league.settings.maxRosterSize, "number")}
-            ${field("maxAcquisitions", "Max Acquisitions", league.settings.maxAcquisitions)}
-            ${field("maxTrades", "Max Trades", league.settings.maxTrades)}
+            ${numberField("currentWeek", "Current Week", state.data.meta.currentWeek, { min: 1, max: 22 })}
+            ${selectField("scoringType", "Scoring Type", [["Head-to-Head Points","Head-to-Head Points"],["Points Only","Points Only"]], league.settings.scoringType)}
+            ${numberField("maxTeams", "Max Teams", league.settings.maxTeams, { min: 2, max: 20 })}
+            ${numberField("maxRosterSize", "Max Roster Size", league.settings.maxRosterSize, { min: 1, max: 30 })}
+            ${selectField("maxAcquisitions", "Max Acquisitions", [["No max","No max"],["25","25"],["50","50"],["75","75"],["100","100"]], league.settings.maxAcquisitions)}
+            ${selectField("maxTrades", "Max Trades", [["No max","No max"],["5","5"],["10","10"],["15","15"],["20","20"]], league.settings.maxTrades)}
             ${checkbox("fractionalPoints", "Fractional Points", league.settings.fractionalPoints)}
             ${checkbox("negativePoints", "Negative Points", league.settings.negativePoints)}
             ${checkbox("publicViewable", "Publicly Viewable", league.settings.publicViewable)}
@@ -1410,37 +1655,36 @@ function adminView() {
         </div>
         <div class="settings-section">
           <h3>Roster</h3>
-          <div class="settings-grid">
-            ${field("starters", "Starting Slots", league.roster.starters.join(", "))}
-            ${field("bench", "Bench Slots", league.roster.bench, "number")}
-            ${field("ir", "IR Slots", league.roster.ir, "number")}
+          <div class="settings-grid roster-rule-grid">
+            ${rosterSlotControls(league.roster.starters)}
+            ${numberField("bench", "Bench Slots", league.roster.bench, { min: 0, max: 20 })}
+            ${numberField("ir", "IR Slots", league.roster.ir, { min: 0, max: 10 })}
           </div>
         </div>
         <div class="settings-section">
           <h3>Waivers, Trades, Draft, Playoffs</h3>
           <div class="settings-grid">
-            ${field("waiverType", "Waiver Type", league.waiver.type)}
-            <label><span>Waiver Mode</span><select name="waiverMode"><option value="rolling" ${league.waiver.mode === "rolling" ? "selected" : ""}>Rolling Priority</option><option value="faab" ${league.waiver.mode === "faab" ? "selected" : ""}>FAAB</option><option value="free_agent_windows" ${league.waiver.mode === "free_agent_windows" ? "selected" : ""}>Free-Agent Windows</option></select></label>
-            ${field("waiverPeriodDays", "Waiver Days", league.waiver.periodDays, "number")}
-            ${field("weeklyWaivers", "Weekly Waivers", league.waiver.weekly)}
-            ${field("waiverBudget", "Waiver Budget", league.waiver.budget || 100, "number")}
-            ${field("freeAgentWindows", "Free-Agent Windows", league.waiver.freeAgentWindows || "Wed-Sun")}
+            <label><span>Waiver Mode</span>${segmentedField("waiverMode", [["rolling","Rolling"],["faab","FAAB"],["free_agent_windows","Free-agent windows"]], league.waiver.mode || "rolling")}</label>
+            ${numberField("waiverPeriodDays", "Waiver Days", league.waiver.periodDays, { min: 0, max: 7 })}
+            ${selectField("weeklyWaivers", "Weekly Waivers", [["Game Time - Tuesday","Game Time - Tuesday"],["Wednesday","Wednesday"],["Daily","Daily"],["None","None"]], league.waiver.weekly)}
+            ${numberField("waiverBudget", "Waiver Budget", league.waiver.budget || 100, { min: 0, max: 1000 })}
+            ${selectField("freeAgentWindows", "Free-Agent Windows", [["Wed-Sun","Wed-Sun"],["Daily","Daily"],["After waivers clear","After waivers clear"],["Locked during games","Locked during games"]], league.waiver.freeAgentWindows || "Wed-Sun")}
             ${checkbox("allowFreeAgentAdds", "Allow Free Agent Adds", league.waiver.allowFreeAgentAdds !== false)}
             ${checkbox("allowWaiverAdds", "Allow Waiver Claims", league.waiver.allowWaiverAdds !== false)}
             ${checkbox("allowInjuredToIR", "Allow Injured Directly To IR", league.waiver.allowInjuredToIR)}
-            ${field("tradeReview", "Trade Review", league.trade.review)}
-            ${field("tradeRejectionDays", "Trade Reject Days", league.trade.rejectionDays, "number")}
-            ${field("tradeDeadline", "Trade Deadline", league.trade.deadline || "Season default")}
-            ${field("playoffRosterLock", "Playoff Roster Lock", league.trade.playoffRosterLock || "Lock eliminated teams")}
+            ${selectField("tradeReview", "Trade Review", [["Commissioner approval","Commissioner approval"],["League vote","League vote"],["Instant","Instant"]], league.trade.review)}
+            ${numberField("tradeRejectionDays", "Trade Reject Days", league.trade.rejectionDays, { min: 0, max: 7 })}
+            ${selectField("tradeDeadline", "Trade Deadline", [["Season default","Season default"],["Week 10","Week 10"],["Week 11","Week 11"],["Week 12","Week 12"],["No deadline","No deadline"]], league.trade.deadline || "Season default")}
+            ${selectField("playoffRosterLock", "Playoff Roster Lock", [["Lock eliminated teams","Lock eliminated teams"],["No playoff lock","No playoff lock"],["Lock all playoff teams","Lock all playoff teams"]], league.trade.playoffRosterLock || "Lock eliminated teams")}
             ${checkbox("allowDraftPickTrades", "Allow Draft Pick Trades", league.trade.allowDraftPickTrades)}
-            ${field("draftType", "Draft Type", league.draft.type)}
-            ${field("pickTimeSeconds", "Pick Time Seconds", league.draft.pickTimeSeconds, "number")}
-            ${field("playoffTeams", "Playoff Teams", league.playoffs.teams, "number")}
-            ${field("playoffWeeks", "Playoff Weeks", league.playoffs.weeks)}
-            ${field("consolationTeams", "Consolation Teams", league.playoffs.consolationTeams, "number")}
-            ${field("playoffFormat", "Playoff Format", league.playoffs.format || "Semifinal + Championship")}
-            ${field("rosterTemplate", "Roster Template", league.roster.template || "Yahoo default")}
-            ${field("positionEligibility", "Position Eligibility", league.roster.positionEligibility || "FLEX=RB/WR/TE")}
+            ${selectField("draftType", "Draft Type", [["Live Standard Draft","Live Standard Draft"],["Offline Draft","Offline Draft"],["Auction Draft","Auction Draft"]], league.draft.type)}
+            ${numberField("pickTimeSeconds", "Pick Time Seconds", league.draft.pickTimeSeconds, { min: 15, max: 300 })}
+            ${numberField("playoffTeams", "Playoff Teams", league.playoffs.teams, { min: 2, max: Math.max(2, Number(league.settings.maxTeams || 12)) })}
+            ${selectField("playoffWeeks", "Playoff Weeks", [["15 & 16","15 & 16"],["14 & 15","14 & 15"],["16 & 17","16 & 17"]], league.playoffs.weeks)}
+            ${numberField("consolationTeams", "Consolation Teams", league.playoffs.consolationTeams, { min: 0, max: Math.max(0, Number(league.settings.maxTeams || 12)) })}
+            ${selectField("playoffFormat", "Playoff Format", [["Semifinal + Championship","Semifinal + Championship"],["Single-week bracket","Single-week bracket"],["Two-week championship","Two-week championship"]], league.playoffs.format || "Semifinal + Championship")}
+            ${selectField("rosterTemplate", "Roster Template", [["Yahoo default","Yahoo default"],["Superflex","Superflex"],["No kicker","No kicker"],["Custom","Custom"]], league.roster.template || "Yahoo default")}
+            ${selectField("positionEligibility", "Position Eligibility", [["FLEX=RB/WR/TE","FLEX=RB/WR/TE"],["FLEX=RB/WR/TE/QB","FLEX=RB/WR/TE/QB"],["FLEX=WR/TE","FLEX=WR/TE"]], league.roster.positionEligibility || "FLEX=RB/WR/TE")}
             ${checkbox("playoffReseeding", "Playoff Reseeding", league.playoffs.reseeding)}
             ${checkbox("lockEliminatedTeams", "Lock Eliminated Teams", league.playoffs.lockEliminatedTeams)}
           </div>
@@ -1478,56 +1722,36 @@ function adminView() {
 }
 
 function settingsView() {
-  const activeTeam = myTeam();
-  return layout(`
-    <section class="page-head"><div><h2>Manager Settings</h2><p>Profile, password, team identity, and local notification preferences.</p></div></section>
-    <section class="card section-gap">
+  const setupCard = shouldShowSetupWizard() ? `
+    <section class="card section-gap setup-card">
       <h3>Setup Wizard</h3>
       ${onboardingPanel()}
       <div class="empty empty-left section-gap-sm"><p>${state.data.onboarding?.inviteInstructions?.manager || ""}</p><p>${state.data.onboarding?.inviteInstructions?.expires || ""}</p></div>
-    </section>
+    </section>` : "";
+  return layout(`
+    <section class="page-head"><div><h2>Manager Settings</h2><p>Profile, password, notifications, devices, and privacy.</p></div></section>
+    ${setupCard}
     <section class="grid two-col">
-      <article class="card appearance-card">
-        <h3>Appearance</h3>
-        <div class="theme-preview">
-          <span class="preview-panel"></span>
-          <span class="preview-panel"></span>
-          <span class="preview-accent"></span>
-        </div>
-        <p class="small">Use the ${state.theme === "dark" ? "light" : "dark"} theme for this browser.</p>
-        <button class="primary" data-action="theme-toggle">${state.theme === "dark" ? "Switch to Light Mode" : "Switch to Dark Mode"}</button>
-      </article>
       <article class="card">
         <h3>Profile</h3>
-        <form class="form-grid" data-form="profile">
+        <form class="form-grid" data-form="profile" data-setup-section="profile">
           <label><span class="small">Display Name</span><input name="displayName" value="${state.user.displayName}"></label>
           <label><span class="small">Username</span><input name="username" value="${state.user.username}" autocomplete="username"></label>
           <label><span class="small">Contact Email</span><input name="email" value="${state.user.email || ""}" type="email"></label>
-          <label><span class="small">Profile Visibility</span><select name="profileVisibility"><option value="league" ${state.user.profileVisibility === "league" ? "selected" : ""}>League members</option><option value="commissioner" ${state.user.profileVisibility === "commissioner" ? "selected" : ""}>Commissioners only</option></select></label>
+          <label><span class="small">Profile Visibility</span>${segmentedField("profileVisibility", [["league","League members"],["commissioner","Commissioners only"]], state.user.profileVisibility || "league")}</label>
           <button>Save Profile</button>
         </form>
         <h3 class="stack-heading">Password</h3>
-        <form class="form-grid" data-form="self-password">
+        <form class="form-grid" data-form="self-password" data-setup-section="password">
           <input name="currentPassword" type="password" placeholder="Current password" autocomplete="current-password">
           <input name="newPassword" type="password" placeholder="New password" autocomplete="new-password">
           <button>Change Password</button>
         </form>
       </article>
-      <article class="card">
-        <h3>Team Identity</h3>
-        <form class="form-grid" data-form="team-settings" data-team="${activeTeam.id}">
-          <div class="team-preview">${teamAvatar(activeTeam, 52)}<strong>${activeTeam.name}</strong></div>
-          <input name="name" value="${activeTeam.name}" placeholder="Team name">
-          <input name="manager" value="${activeTeam.manager}" placeholder="Initials">
-          <input name="logoUrl" value="${activeTeam.logoUrl || ""}" placeholder="Logo URL">
-          <label><span class="small">Team Color</span><input name="color" type="color" value="${activeTeam.color || "#4f7ee8"}"></label>
-          <button>Save Team Identity</button>
-        </form>
-      </article>
     </section>
     <section class="card section-gap">
       <h3>Notifications</h3>
-      <form class="settings-form" data-form="notifications">
+      <form class="settings-form" data-form="notifications" data-setup-section="notifications">
         <div class="settings-grid">
           ${notificationCheckbox("roster", "Roster Moves")}
           ${notificationCheckbox("draft", "Draft")}
@@ -1693,6 +1917,33 @@ function weeklyOpsPanel(weekly = {}) {
   </div>`;
 }
 
+function seasonSimPanel(sim = {}) {
+  const cannotAdvance = (sim.teams || 0) < 4 || sim.draftStatus !== "complete" || sim.seasonPhase === "offseason";
+  const disabled = cannotAdvance ? "disabled" : "";
+  const completed = sim.completedWeeks || [];
+  const champion = sim.championName || (sim.championTeamId ? team(sim.championTeamId)?.name : "");
+  return `<div class="season-sim-panel">
+    <div class="job-grid">
+      <div class="health-tile"><strong>Stage</strong><span>${labelize(sim.stage || "setup")}</span><p class="small">${sim.nextAction || "Prepare the lab."}</p></div>
+      <div class="health-tile"><strong>Teams</strong><span>${sim.teams || 0}</span><p class="small">${sim.users || 0} user account(s)</p></div>
+      <div class="health-tile"><strong>Draft</strong><span>${labelize(sim.draftStatus || "not_started")}</span><p class="small">${sim.rosteredTeams || 0} rostered team(s)</p></div>
+      <div class="health-tile"><strong>Week</strong><span>${sim.currentWeek || 1}</span><p class="small">${completed.length} completed</p></div>
+    </div>
+    ${(sim.blockers || []).length ? `<div class="empty empty-left section-gap-sm">${sim.blockers.map((item) => `<p>${item}</p>`).join("")}</div>` : ""}
+    <div class="sim-progress section-gap-sm">
+      ${Array.from({ length: 16 }, (_, index) => index + 1).map((week) => `<span class="${completed.includes(week) ? "done" : Number(sim.currentWeek) === week ? "current" : ""}">${week}</span>`).join("")}
+    </div>
+    <div class="toolbar section-gap-sm">
+      <button data-action="season-sim-prepare">Reset Sim Lab</button>
+      <button data-action="season-sim-draft" ${(sim.teams || 0) < 4 ? "disabled" : ""}>Run Sim Draft</button>
+      <button class="primary" data-action="season-sim-next" ${disabled}>Next Week</button>
+      <button data-action="season-sim-run-to-end" ${disabled}>Run To Championship</button>
+    </div>
+    <p class="small">${sim.lastResult || "This uses a deterministic 2025 replay fixture so you can test every app stage without waiting for live NFL data."}</p>
+    ${champion ? `<div class="empty ok section-gap-sm"><strong>Champion:</strong> ${champion}</div>` : ""}
+  </div>`;
+}
+
 function dryRunPanel(preview) {
   return `<div class="backup-panel section-gap-sm">
     <div class="between"><strong>${preview.title}</strong><span class="pill">${preview.type}</span></div>
@@ -1734,7 +1985,7 @@ function providerOpsPanel(ops = {}) {
           ${checkbox("cacheSnapshots", "Cache Provider Snapshots", settings.cacheSnapshots !== false)}
           ${checkbox("manualImportAllowed", "Allow Manual Stat Imports", settings.manualImportAllowed !== false)}
           ${checkbox("providerDemoMode", "Provider Demo Mode", state.data.meta.providerDemoMode === true)}
-          <label><span>Demo Scenario</span><select name="providerDemoScenario"><option value="unavailable" ${state.data.meta.providerDemoScenario === "unavailable" ? "selected" : ""}>Unavailable</option><option value="delayed" ${state.data.meta.providerDemoScenario === "delayed" ? "selected" : ""}>Delayed Stats</option><option value="missing_players" ${state.data.meta.providerDemoScenario === "missing_players" ? "selected" : ""}>Missing Players</option></select></label>
+          <label><span>Demo Scenario</span>${segmentedField("providerDemoScenario", [["unavailable","Unavailable"],["delayed","Delayed stats"],["missing_players","Missing players"]], state.data.meta.providerDemoScenario || "unavailable")}</label>
         </div>
         <button>Save Provider Settings</button>
       </form>
@@ -1743,7 +1994,7 @@ function providerOpsPanel(ops = {}) {
         <div class="settings-grid">
           ${field("season", "Season", state.data.meta.season, "number")}
           ${field("week", "Week", state.data.meta.currentWeek, "number")}
-          <label><span>Stat Type</span><select name="statType"><option value="actual">Actual</option><option value="projection">Projection</option></select></label>
+          <label><span>Stat Type</span>${segmentedField("statType", [["actual","Actual"],["projection","Projection"]], "actual")}</label>
         </div>
         <textarea name="csv" placeholder="player,fantasyPoints&#10;Josh Allen,24.6"></textarea>
         <button>Import Manual Stats</button>
@@ -1847,6 +2098,21 @@ function field(name, label, value, type = "text", step = "1") {
   return `<label><span>${label}</span><input name="${name}" type="${type}" step="${step}" value="${value ?? ""}"></label>`;
 }
 
+function numberField(name, label, value, options = {}) {
+  return `<label><span>${label}</span><input name="${name}" type="number" min="${options.min ?? 0}" max="${options.max ?? 999}" step="${options.step || 1}" value="${value ?? ""}"></label>`;
+}
+
+function selectField(name, label, options, selected) {
+  return `<label><span>${label}</span>${segmentedField(name, options, selected)}</label>`;
+}
+
+function rosterSlotControls(starters = []) {
+  const counts = starters.reduce((acc, slot) => ({ ...acc, [slot]: (acc[slot] || 0) + 1 }), {});
+  return [["QB", 0, 4], ["RB", 0, 6], ["WR", 0, 8], ["TE", 0, 4], ["FLEX", 0, 4], ["K", 0, 2], ["D/ST", 0, 2]]
+    .map(([slot, min, max]) => numberField(`starter_${slot.replace("/", "_")}`, slot, counts[slot] || 0, { min, max }))
+    .join("");
+}
+
 function checkbox(name, label, checked) {
   return `<label class="check-row"><input name="${name}" type="checkbox" ${checked ? "checked" : ""}><span>${label}</span></label>`;
 }
@@ -1879,7 +2145,7 @@ function login() {
         <div class="brand"><div class="shield">◆</div><div><h1>FAMILY<br>FOOTBALL</h1><p>Sign in to manage the league</p></div></div>
         <input name="username" value="admin" placeholder="Username" autocomplete="username">
         <input name="password" value="password" placeholder="Password" type="password" autocomplete="current-password">
-        <button class="primary">Sign In</button>
+        <button class="primary" type="submit">Sign In</button>
         <p class="hint">Seeded local commissioner: admin / password. Change it in Commissioner after sign-in.</p>
         <div class="error">${state.error}</div>
       </form>
@@ -1888,7 +2154,7 @@ function login() {
         <p class="hint">Use a commissioner-generated reset token to set a new password.</p>
         <input name="token" placeholder="Reset token" autocomplete="one-time-code">
         <input name="newPassword" placeholder="New password" type="password" autocomplete="new-password">
-        <button>Reset Password</button>
+        <button type="submit">Reset Password</button>
         <p class="hint">${state.resetTokenMessage}</p>
       </form>
     </main>
@@ -1899,9 +2165,21 @@ function render() {
   if (!state.user || !state.data) return login();
   const views = { dashboard, team: teamView, matchups: matchupsView, league: leagueView, draft: draftView, players: playersView, player: playerDetailView, settings: settingsView, admin: adminView };
   app.innerHTML = (views[state.view] || dashboard)();
+  hydratePickers();
+  focusSetupTarget();
   if (state.view === "admin") { renderAdminUsers(); renderAdminHealth(); }
   if (state.view === "settings") renderSessions();
   if (state.view === "draft") draftRenderEffects();
+}
+
+function focusSetupTarget() {
+  if (!state.setupTarget) return;
+  const target = document.querySelector(`[data-setup-section="${state.setupTarget}"]`);
+  if (!target) return;
+  target.scrollIntoView({ block: "center", behavior: "smooth" });
+  target.classList.add("setup-focus");
+  target.querySelector("input, textarea, button")?.focus();
+  state.setupTarget = "";
 }
 
 function renderAdminUsers() {
@@ -1978,6 +2256,14 @@ setInterval(() => {
 window.addEventListener("hashchange", () => {
   if (!state.user || !state.data) return;
   applyRouteFromLocation();
+  if (["players", "draft", "player"].includes(state.view) && !state.catalogLoaded) {
+    render();
+    ensurePlayerCatalog().then(render).catch((error) => {
+      setToast(error.message, "error");
+      render();
+    });
+    return;
+  }
   render();
 });
 
@@ -1986,6 +2272,11 @@ app.addEventListener("click", async (event) => {
   if (viewButton) {
     event.preventDefault();
     const href = viewButton.getAttribute("href");
+    const targetView = viewButton.dataset.view;
+    if (["players", "draft", "player"].includes(targetView) && !state.catalogLoaded) {
+      render();
+      await ensurePlayerCatalog();
+    }
     if (href?.startsWith("#/")) {
       if (window.location.hash === href) {
         applyRouteFromLocation();
@@ -2012,6 +2303,42 @@ app.addEventListener("click", async (event) => {
     };
     if (destructiveConfirmations[action] && !await confirmAction(destructiveConfirmations[action])) return;
     setActionBusy(actionButton, action, true);
+    if (action === "toggle-notifications") {
+      state.notificationsOpen = !state.notificationsOpen;
+      render();
+      return;
+    }
+    if (action === "picker-option") {
+      const picker = actionButton.closest(".smart-picker");
+      const value = actionButton.dataset.value || "";
+      const multiple = picker?.dataset.pickerMultiple === "true";
+      const current = pickerValues(picker);
+      const next = multiple ? (current.includes(value) ? current.filter((item) => item !== value) : [...current, value]) : [value];
+      syncPickerSelection(picker, next);
+      if (picker?.dataset.pickerName === "toTeamId") {
+        state.tradeToTeam = value;
+        render();
+      }
+      return;
+    }
+    if (action === "picker-remove") {
+      const picker = actionButton.closest(".smart-picker");
+      syncPickerSelection(picker, pickerValues(picker).filter((value) => value !== actionButton.dataset.value));
+      return;
+    }
+    if (action === "position-chip") {
+      event.preventDefault();
+      state.position = actionButton.dataset.position || "ALL";
+      state.playersPage = 1;
+      navigate(state.view, { position: state.position, page: 1 }, true);
+      return;
+    }
+    if (action === "team-switch") {
+      state.selectedTeam = actionButton.dataset.team;
+      state.selectedSlot = null;
+      navigate("team", { tab: state.teamTab, teamId: state.selectedTeam });
+      return;
+    }
     if (action === "view-player") {
       event.preventDefault();
       navigate("player", { playerId: actionButton.dataset.player });
@@ -2063,6 +2390,19 @@ app.addEventListener("click", async (event) => {
       if (linkedAction) setToast(`${labelize(linkedAction)} is available on this screen.`, "info");
       return;
     }
+    if (action === "setup-jump") {
+      event.preventDefault();
+      const targets = {
+        password: { view: "settings" },
+        profile: { view: "settings" },
+        team: { view: "team", params: { tab: "roster" } },
+        notifications: { view: "settings" }
+      };
+      const target = targets[actionButton.dataset.step] || { view: "settings" };
+      state.setupTarget = actionButton.dataset.step || "";
+      navigate(target.view, target.params || {});
+      return;
+    }
     if (action === "dialog-cancel" || action === "dialog-confirm") {
       const dialog = state.dialog;
       const resolve = state.dialogResolve;
@@ -2086,6 +2426,7 @@ app.addEventListener("click", async (event) => {
     }
     if (action === "mark-activity-read") {
       await api("/api/activity/read", { method: "POST", body: JSON.stringify({ all: true }) });
+      state.notificationsOpen = false;
       await refresh();
     }
     if (action === "chat-react") {
@@ -2120,7 +2461,7 @@ app.addEventListener("click", async (event) => {
       return;
     }
     if (action === "dry-run-phase") {
-      const phase = document.querySelector("[data-form='season-phase'] select[name='phase']")?.value || state.data.meta.seasonPhase;
+      const phase = new FormData(document.querySelector("[data-form='season-phase']")).get("phase") || state.data.meta.seasonPhase;
       state.dryRun = await api("/api/admin/dry-run", { method: "POST", body: JSON.stringify({ type: "phase", payload: { phase } }) });
       render();
       return;
@@ -2179,6 +2520,26 @@ app.addEventListener("click", async (event) => {
     }
     if (action === "provider-map") {
       await api("/api/admin/provider/map", { method: "POST", body: JSON.stringify({ providerId: actionButton.dataset.provider, playerId: actionButton.dataset.player }) });
+      await refresh();
+      return;
+    }
+    if (action === "season-sim-prepare") {
+      await api("/api/admin/season-sim/prepare", { method: "POST" });
+      await refresh();
+      return;
+    }
+    if (action === "season-sim-draft") {
+      await api("/api/admin/season-sim/draft", { method: "POST" });
+      await refresh();
+      return;
+    }
+    if (action === "season-sim-next") {
+      await api("/api/admin/season-sim/next-week", { method: "POST" });
+      await refresh();
+      return;
+    }
+    if (action === "season-sim-run-to-end") {
+      await api("/api/admin/season-sim/run-to-end", { method: "POST" });
       await refresh();
       return;
     }
@@ -2371,8 +2732,8 @@ app.addEventListener("click", async (event) => {
     if (action === "compare-trade-form") {
       const form = actionButton.closest("form");
       state.tradeCompareIds = [
-        ...selectedValues(form.elements.offeredPlayerIds),
-        ...selectedValues(form.elements.requestedPlayerIds)
+        ...formValues(form, "offeredPlayerIds"),
+        ...formValues(form, "requestedPlayerIds")
       ];
       render();
       return;
@@ -2419,11 +2780,19 @@ app.addEventListener("click", async (event) => {
 
 app.addEventListener("input", (event) => {
   const action = event.target.dataset.action;
+  if (action === "logo-upload") {
+    handleLogoUpload(event.target);
+    return;
+  }
+  if (action === "picker-search") {
+    const picker = event.target.closest(".smart-picker");
+    renderPickerOptions(picker);
+    return;
+  }
   if (action === "filter") {
     state.filter = event.target.value;
     state.playersPage = 1;
-    if (["players", "draft"].includes(state.view)) navigate(state.view, { filter: state.filter, page: 1 }, true);
-    else render();
+    renderWithFocus(event.target);
   }
   if (action === "position") {
     state.position = event.target.value;
@@ -2433,6 +2802,37 @@ app.addEventListener("input", (event) => {
   }
   if (action === "select-team") { state.selectedTeam = event.target.value; state.selectedSlot = null; state.teamTab = "roster"; navigate("team", { tab: "roster", teamId: state.selectedTeam }); }
 });
+
+function renderWithFocus(input) {
+  const key = input.dataset.focusKey || input.dataset.action || input.name || "";
+  const selectionStart = input.selectionStart;
+  const selectionEnd = input.selectionEnd;
+  render();
+  const next = key ? document.querySelector(`[data-focus-key="${key}"], [data-action="${key}"]`) : null;
+  if (next) {
+    next.focus();
+    if (typeof next.setSelectionRange === "function") next.setSelectionRange(selectionStart, selectionEnd);
+  }
+}
+
+function handleLogoUpload(input) {
+  const file = input.files?.[0];
+  if (!file) return;
+  if (file.size > 300 * 1024) {
+    input.value = "";
+    setToast("Logo image must be 300 KB or smaller.", "error");
+    render();
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = () => {
+    const form = input.closest("form");
+    const target = form?.querySelector("input[name='logoUpload']");
+    if (target) target.value = reader.result;
+    setToast("Logo image ready. Save the team to keep it.", "info");
+  };
+  reader.readAsDataURL(file);
+}
 
 app.addEventListener("submit", async (event) => {
   const form = event.target.closest("form");
@@ -2461,7 +2861,7 @@ app.addEventListener("submit", async (event) => {
     if (kind === "password") await api(`/api/admin/users/${form.dataset.user}/password`, { method: "PUT", body: JSON.stringify(values) });
     if (kind === "profile") await api("/api/profile", { method: "PUT", body: JSON.stringify(values) });
     if (kind === "self-password") await api("/api/profile/password", { method: "PUT", body: JSON.stringify(values) });
-    if (kind === "team-settings") await api(`/api/teams/${form.dataset.team}`, { method: "PUT", body: JSON.stringify(values) });
+    if (kind === "team-settings") await api(`/api/teams/${form.dataset.team}`, { method: "PUT", body: JSON.stringify(teamSettingsPayload(form)) });
     if (kind === "season-phase") await api("/api/admin/season/phase", { method: "PUT", body: JSON.stringify(values) });
     if (kind === "draft-config") await api("/api/admin/draft/config", { method: "PUT", body: JSON.stringify(draftConfigPayload(form)) });
     if (kind === "draft-keeper") await api("/api/admin/draft/keepers", { method: "POST", body: JSON.stringify(values) });
@@ -2505,13 +2905,17 @@ function selectedValues(select) {
   return Array.from(select?.selectedOptions || []).map((option) => option.value);
 }
 
+function formValues(form, name) {
+  return new FormData(form).getAll(name).filter(Boolean);
+}
+
 function tradePayload(form) {
   const values = Object.fromEntries(new FormData(form).entries());
   return {
     fromTeamId: values.fromTeamId,
     toTeamId: values.toTeamId,
-    offeredPlayerIds: selectedValues(form.elements.offeredPlayerIds),
-    requestedPlayerIds: selectedValues(form.elements.requestedPlayerIds),
+    offeredPlayerIds: formValues(form, "offeredPlayerIds"),
+    requestedPlayerIds: formValues(form, "requestedPlayerIds"),
     message: values.message || ""
   };
 }
@@ -2522,6 +2926,17 @@ function researchPayload(form) {
     playerId: values.playerId,
     note: values.note || "",
     watchlist: Boolean(form.elements.watchlist?.checked)
+  };
+}
+
+function teamSettingsPayload(form) {
+  const values = Object.fromEntries(new FormData(form).entries());
+  return {
+    name: values.name || "",
+    manager: values.manager || "",
+    logoUrl: values.logoUrl || "",
+    logoUpload: values.logoUpload || "",
+    color: values.color || "#4f7ee8"
   };
 }
 
@@ -2543,13 +2958,18 @@ function leaguePayload(form) {
   const values = Object.fromEntries(new FormData(form).entries());
   const checked = (name) => form.elements[name]?.checked || false;
   const number = (name) => Number(values[name] || 0);
+  const starters = [];
+  for (const slot of ["QB", "RB", "WR", "TE", "FLEX", "K", "D/ST"]) {
+    const count = Number(values[`starter_${slot.replace("/", "_")}`] || 0);
+    for (let index = 0; index < count; index += 1) starters.push(slot);
+  }
   const scoring = {};
   for (const [key, value] of Object.entries(values)) {
     if (key.startsWith("score_")) scoring[key.replace("score_", "")] = Number(value);
   }
+  const waiverTypeByMode = { rolling: "Rolling waivers", faab: "FAAB", free_agent_windows: "Free-agent windows" };
   return {
     name: values.name,
-    season: number("season"),
     currentWeek: number("currentWeek"),
     settings: {
       scoringType: values.scoringType,
@@ -2562,17 +2982,17 @@ function leaguePayload(form) {
       publicViewable: checked("publicViewable")
     },
     roster: {
-      starters: values.starters.split(",").map((slot) => slot.trim()).filter(Boolean),
+      starters,
       bench: number("bench"),
       ir: number("ir"),
       template: values.rosterTemplate,
       positionEligibility: values.positionEligibility
     },
     waiver: {
-      type: values.waiverType,
+      type: waiverTypeByMode[values.waiverMode] || "Rolling waivers",
       periodDays: number("waiverPeriodDays"),
       weekly: values.weeklyWaivers,
-      mode: values.waiverMode || (values.waiverType?.toLowerCase().includes("rolling") ? "rolling" : "custom"),
+      mode: values.waiverMode || "rolling",
       processDay: values.weeklyWaivers,
       budget: number("waiverBudget"),
       freeAgentWindows: values.freeAgentWindows,

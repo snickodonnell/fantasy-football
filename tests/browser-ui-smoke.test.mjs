@@ -6,7 +6,7 @@ const app = readFileSync(new URL("../public/app.js", import.meta.url), "utf8");
 const css = readFileSync(new URL("../public/styles.css", import.meta.url), "utf8");
 
 test("browser smoke coverage includes login, navigation, manager, commissioner, and mobile surfaces", () => {
-  for (const marker of ["data-form=\"login\"", "availableNav", "settingsView", "adminView", "Launch Readiness", "Seeded Rehearsal", "Real League Setup Review", "modal-card", "admin-tab", "giant-switch", "is-busy", "mobile-nav"]) {
+  for (const marker of ["data-form=\"login\"", "availableNav", "settingsView", "adminView", "Launch Readiness", "Seeded Rehearsal", "Real League Setup Review", "Season Sim Lab", "modal-card", "admin-tab", "giant-switch", "is-busy", "mobile-nav"]) {
     assert.ok(app.includes(marker), `missing ${marker}`);
   }
 });
@@ -27,4 +27,11 @@ test("client render paths build lookup indexes for large player catalogs", () =>
   for (const marker of ["rebuildIndexes", "playersById", "rostersByTeam", "providerBySleeperId", "weeklyStatsByPlayer", "availablePlayers"]) {
     assert.ok(app.includes(marker), `missing ${marker}`);
   }
+});
+
+test("modernized navigation and selection controls are present", () => {
+  for (const marker of ["notificationFlyout", "leagueSidePanel", "smartPicker", "picker-results", "segmentedField", "team-switcher"]) {
+    assert.ok(app.includes(marker) || css.includes(marker), `missing ${marker}`);
+  }
+  assert.equal(app.includes("<select"), false);
 });

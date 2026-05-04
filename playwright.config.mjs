@@ -11,7 +11,7 @@ export default defineConfig({
     screenshot: "only-on-failure"
   },
   webServer: {
-    command: "npm run seed && npm start",
+    command: "node --no-warnings server.js --seed --db=data/e2e.sqlite && node --no-warnings server.js --db=data/e2e.sqlite",
     url: "http://127.0.0.1:3100",
     reuseExistingServer: true,
     timeout: 15_000

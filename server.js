@@ -10,9 +10,10 @@ import zlib from "node:zlib";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(__dirname, "data");
-const DB_PATH = path.join(DATA_DIR, "app.sqlite");
+const DB_PATH = path.resolve(__dirname, process.env.FF_DB_PATH || argValue("--db") || path.join(DATA_DIR, "app.sqlite"));
 const BACKUP_DIR = path.join(DATA_DIR, "backups");
 const PUBLIC_DIR = path.join(__dirname, "public");
+const TEAM_LOGO_DIR = path.join(PUBLIC_DIR, "uploads", "team-logos");
 loadEnvFile(path.join(__dirname, ".env"));
 const PORT = Number(process.env.PORT || 3100);
 const HOST = process.env.HOST || "0.0.0.0";
@@ -24,6 +25,7 @@ const BDL_FREE_INTERVAL_SECONDS = 13;
 const SLEEPER_PLAYER_REFRESH_HOURS = 23;
 const SLEEPER_TRENDING_REFRESH_MINUTES = 15;
 const LAN_ALLOWLIST = (process.env.LAN_ALLOWLIST || "").split(",").map((item) => item.trim()).filter(Boolean);
+const LEGAL_FANTASY_POSITIONS = new Set(["QB", "RB", "WR", "TE", "FLEX", "K", "D/ST"]);
 const rateBuckets = new Map();
 const seededPasswordCache = new Map();
 let scheduledBackupTimer = null;
@@ -31,8 +33,15 @@ let playerSyncTimer = null;
 let playerSyncRunning = false;
 let dbCache = null;
 
+function argValue(name) {
+  const prefix = `${name}=`;
+  const exactIndex = process.argv.indexOf(name);
+  if (exactIndex >= 0) return process.argv[exactIndex + 1] || "";
+  return process.argv.find((arg) => arg.startsWith(prefix))?.slice(prefix.length) || "";
+}
+
 if (SESSION_SECRET === DEFAULT_SESSION_SECRET && !process.argv.includes("--seed")) {
-  console.warn("WARNING: using the default SESSION_SECRET. Set a long random SESSION_SECRET in .env before sharing this app beyond local development.");
+  console.log("WARNING: using the default SESSION_SECRET. Set a long random SESSION_SECRET in .env before sharing this app beyond local development.");
 }
 
 function loadEnvFile(filePath) {
@@ -160,31 +169,23 @@ const samplePlayers = [
 }));
 
 function initialDb() {
-  const teams = familyManagers.map((manager, index) => ({
-    id: manager.teamId,
-    name: `${manager.displayName}'s Team`,
-    manager: initialsFor(manager.displayName),
-    ownerUserId: manager.id,
+  const commissioner = familyManagers[0];
+  const teams = [{
+    id: commissioner.teamId,
+    name: `${commissioner.displayName}'s Team`,
+    manager: initialsFor(commissioner.displayName),
+    ownerUserId: commissioner.id,
     logoUrl: "",
-    color: teamColors[index % teamColors.length],
-    wins: index < 3 ? 3 : 2,
-    losses: index < 3 ? 2 : 3,
+    color: teamColors[0],
+    wins: 0,
+    losses: 0,
     ties: 0,
-    waiverRank: index + 1
-  }));
-  const rosters = {
-    t1: ["p1","p2","p3","p4","p5","p6","p7","p8","p9","p10","p11","p12","p13","p14","p15"],
-    t2: ["p16","p17","p18","p19","p20","p21"],
-    t3: ["p22","p23","p24"],
-    t4: [], t5: [], t6: []
-  };
-  const players = samplePlayers.map((player) => {
-    const teamId = Object.keys(rosters).find((id) => rosters[id].includes(player.id)) || null;
-    return { ...player, ownership: teamId };
-  });
+    waiverRank: 1
+  }];
+  const players = samplePlayers.map((player) => ({ ...player, ownership: null }));
   return {
-    meta: { version: 1, seededAt: new Date().toISOString(), currentWeek: 6, season: 2026, seasonPhase: "regular_season" },
-    users: familyManagers.map((manager) => makeUser(manager.id, manager.username, manager.displayName, manager.role, "password")),
+    meta: { version: 1, seededAt: new Date().toISOString(), currentWeek: 1, season: 2026, seasonPhase: "preseason" },
+    users: [makeUser(commissioner.id, commissioner.username, commissioner.displayName, commissioner.role, "password")],
     sessions: [],
     league: {
       id: "league-1",
@@ -212,31 +213,15 @@ function initialDb() {
     },
     teams,
     players,
-    lineups: {
-      t1: { QB: "p1", RB: "p2", RB2: "p3", WR: "p4", WR2: "p5", TE: "p6", FLEX: "p7", "D/ST": "p8", K: "p9" },
-      t2: { QB: "p16", RB: "p17", RB2: "p21", WR: "p18", WR2: "p20", TE: "p19" },
-      t3: { QB: "p22", WR: "p23", WR2: "p24" }
-    },
-    matchups: [
-      { id: "m1", week: 6, homeTeamId: "t1", awayTeamId: "t2", homeScore: 118.4, awayScore: 110.2, status: "preview" },
-      { id: "m2", week: 6, homeTeamId: "t3", awayTeamId: "t4", homeScore: 96.2, awayScore: 101.7, status: "preview" },
-      { id: "m3", week: 6, homeTeamId: "t5", awayTeamId: "t6", homeScore: 104.5, awayScore: 98.1, status: "preview" }
-    ],
-    transactions: [
-      { id: "tx1", type: "add", teamId: "t1", playerId: "p11", note: "Sophie A. added Zay Flowers", createdAt: Date.now() - 7200000 },
-      { id: "tx2", type: "drop", teamId: "t3", playerName: "Rashad Penny", note: "Mike M. dropped Rashad Penny", createdAt: Date.now() - 10800000 },
-      { id: "tx3", type: "win", teamId: "t2", note: "The Parkers won vs The Thompsons", createdAt: Date.now() - 86400000 }
-    ],
+    lineups: { [commissioner.teamId]: {} },
+    matchups: [],
+    transactions: [],
     waiverClaims: [],
     trades: [],
-    chat: [
-      { id: "c1", author: "Mom", body: "Great win this week, everyone!", createdAt: Date.now() - 3600000 },
-      { id: "c2", author: "Dad", body: "Those Thursday night games are going to be huge.", createdAt: Date.now() - 1800000 },
-      { id: "c3", author: "Uncle Mike", body: "Let's keep it friendly and have fun. Good luck all!", createdAt: Date.now() - 900000 }
-    ],
+    chat: [],
     providerSync: { provider: "mock", lastRunAt: null, message: "Using seeded local data until an API key is configured.", nextPlayerCursor: null, details: {} },
     activityEvents: [],
-    notificationPreferences: familyManagers.map((manager) => defaultNotificationPreferences(manager.id)),
+    notificationPreferences: [defaultNotificationPreferences(commissioner.id)],
     nflTeams: [],
     nflGames: [],
     nflPlayerStats: [],
@@ -259,6 +244,31 @@ function initialsFor(value = "") {
 function makeUser(id, username, displayName, role, password) {
   const salt = crypto.randomBytes(16).toString("hex");
   return { id, username, displayName, role, passwordHash: hashPassword(password, salt), salt, email: "", profileVisibility: "league", createdAt: Date.now() };
+}
+
+function createTeamForUser(db, user, options = {}) {
+  const base = String(options.name || `${user.displayName || user.username}'s Team`).trim().slice(0, 60) || "New Team";
+  let id = `t${Date.now()}`;
+  let suffix = 1;
+  while (db.teams.some((team) => team.id === id)) id = `t${Date.now()}-${suffix++}`;
+  const team = {
+    id,
+    name: base,
+    manager: initialsFor(user.displayName || user.username),
+    ownerUserId: user.id,
+    logoUrl: "",
+    color: teamColors[(db.teams || []).length % teamColors.length],
+    wins: 0,
+    losses: 0,
+    ties: 0,
+    waiverRank: (db.teams || []).length + 1
+  };
+  db.teams.push(team);
+  db.lineups = db.lineups || {};
+  db.lineups[team.id] = {};
+  normalizeDraftState(db);
+  db.league.draft.order = [...new Set([...(db.league.draft.order || []), team.id])];
+  return team;
 }
 
 function hashPassword(password, salt) {
@@ -1072,6 +1082,21 @@ async function saveDb(data) {
   }
 }
 
+async function saveSessionsOnly(sessions = []) {
+  const db = await getSqlite();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.exec("DELETE FROM sessions");
+    const insertSession = db.prepare("INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)");
+    for (const session of sessions) insertSession.run(session.token, session.userId, session.createdAt, session.expiresAt);
+    db.exec("COMMIT");
+    if (dbCache) dbCache.sessions = structuredClone(sessions);
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
 function parseJson(value) {
   try {
     return JSON.parse(value);
@@ -1244,6 +1269,7 @@ function enrich(db, user) {
   const preferences = normalizeNotificationPreferences(db).find((pref) => pref.userId === user?.id) || defaultNotificationPreferences(user?.id);
   const providerPlayers = db.providerPlayers || [];
   const weeklyPlayerStats = db.weeklyPlayerStats || [];
+  const clientPlayers = clientPlayerCatalog(db, user);
   return {
     currentUser: safeUser(user),
     users: isAdminUser(user) ? db.users.map(safeUser) : [],
@@ -1251,7 +1277,8 @@ function enrich(db, user) {
     meta: { ...db.meta, setupRequired: hasSeededPassword(user), phaseLabel: labelForPhase(db.meta.seasonPhase), phaseActions: Object.fromEntries(Object.keys(phaseActions).map((action) => [action, canPerformInPhase(db, action)])) },
     teams,
     myTeam,
-    players: db.players,
+    players: clientPlayers,
+    catalog: playerCatalogSummary(db, clientPlayers),
     lineups: db.lineups,
     matchups: db.matchups,
     transactions: db.transactions.sort((a, b) => b.createdAt - a.createdAt),
@@ -1289,6 +1316,7 @@ function enrich(db, user) {
       playerSyncPlan: playerSyncPlan(db),
       providerSnapshots: db.meta.providerSnapshots || [],
       providerMappings: db.meta.providerMappings || {},
+      seasonSim: seasonSimState(db),
       weekly: weeklyOperations(db)
     },
     onboarding: firstLoginOnboarding(db, user),
@@ -1300,13 +1328,72 @@ function enrich(db, user) {
     chatReactions: db.meta.chatReactions || {},
     nflTeams: db.nflTeams || [],
     nflGames: db.nflGames || [],
-    providerPlayers,
+    providerPlayers: [],
     providerTrending: db.providerTrending || [],
     scoring: {
       weeklyStats: weeklyPlayerStats,
       corrections: db.scoreCorrections || [],
       locks: db.lineupLocks || [],
       summary: scoringSummary(db)
+    }
+  };
+}
+
+function playerCatalogSummary(db, clientPlayers = []) {
+  const total = db.players?.length || 0;
+  const returned = clientPlayers.length;
+  return {
+    total,
+    returned,
+    loadedAll: returned >= total,
+    providerPlayers: db.providerPlayers?.length || 0,
+    bdlPlayers: db.players?.filter((player) => String(player.id).startsWith("bdl-")).length || 0
+  };
+}
+
+function clientPlayerCatalog(db, user, limit = 450) {
+  const requiredIds = new Set();
+  for (const player of db.players || []) if (player.ownership) requiredIds.add(player.id);
+  for (const lineup of Object.values(db.lineups || {})) for (const playerId of Object.values(lineup || {})) if (playerId) requiredIds.add(playerId);
+  for (const item of db.tradeBlock || []) if (item.playerId) requiredIds.add(item.playerId);
+  for (const item of db.playerResearch || []) if (!user || item.userId === user.id) requiredIds.add(item.playerId);
+  for (const claim of db.waiverClaims || []) {
+    if (claim.addPlayerId) requiredIds.add(claim.addPlayerId);
+    if (claim.dropPlayerId) requiredIds.add(claim.dropPlayerId);
+  }
+  for (const trade of db.trades || []) {
+    for (const playerId of [...(trade.offeredPlayerIds || []), ...(trade.requestedPlayerIds || [])]) requiredIds.add(playerId);
+  }
+  const fantasyPlayers = (db.players || []).filter((player) => isLegalFantasyPosition(player.position));
+  const required = fantasyPlayers.filter((player) => requiredIds.has(player.id));
+  const requiredSet = new Set(required.map((player) => player.id));
+  const available = fantasyPlayers
+    .filter((player) => !requiredSet.has(player.id) && !player.ownership)
+    .sort((a, b) => Number(b.projection || 0) - Number(a.projection || 0) || a.name.localeCompare(b.name))
+    .slice(0, Math.max(0, limit - required.length));
+  return [...required, ...available].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function fullPlayerCatalogResponse(db, query = {}) {
+  const search = String(query.search || "").trim().toLowerCase();
+  const position = String(query.position || "ALL");
+  const page = Math.max(1, Number(query.page || 1));
+  const limit = Math.min(250, Math.max(25, Number(query.limit || 100)));
+  const filtered = (db.players || []).filter((player) => isLegalFantasyPosition(player.position) && (
+    (!search || player.name.toLowerCase().includes(search) || player.nflTeam.toLowerCase().includes(search) || player.position.toLowerCase().includes(search)) &&
+    (position === "ALL" || player.position === position)
+  ));
+  const sorted = filtered.sort((a, b) => Number(b.projection || 0) - Number(a.projection || 0) || a.name.localeCompare(b.name));
+  const start = (page - 1) * limit;
+  return {
+    players: sorted.slice(start, start + limit),
+    total: sorted.length,
+    page,
+    limit,
+    catalog: {
+      total: db.players?.length || 0,
+      providerPlayers: db.providerPlayers?.length || 0,
+      bdlPlayers: db.players?.filter((player) => String(player.id).startsWith("bdl-")).length || 0
     }
   };
 }
@@ -1384,7 +1471,29 @@ function normalizeTeamColor(value) {
 function cleanUrl(value) {
   const url = String(value || "").trim();
   if (!url) return "";
+  if (/^\/uploads\/team-logos\/[-\w.]+$/i.test(url)) return url;
   return /^https?:\/\//i.test(url) ? url.slice(0, 300) : "";
+}
+
+async function saveTeamLogoUpload(team, upload) {
+  const raw = String(upload || "");
+  const match = raw.match(/^data:image\/(png|jpe?g|webp|gif);base64,([A-Za-z0-9+/=]+)$/i);
+  if (!match) return { error: "Logo upload must be a PNG, JPG, WebP, or GIF image." };
+  const extension = match[1].toLowerCase().replace("jpeg", "jpg");
+  const bytes = Buffer.from(match[2], "base64");
+  if (!bytes.length || bytes.byteLength > 300 * 1024) return { error: "Logo image must be 300 KB or smaller." };
+  await mkdir(TEAM_LOGO_DIR, { recursive: true });
+  const safeTeamId = String(team.id).replace(/[^\w-]/g, "");
+  for (const ext of ["png", "jpg", "webp", "gif"]) {
+    if (ext !== extension) await unlink(path.join(TEAM_LOGO_DIR, `${safeTeamId}.${ext}`)).catch(() => {});
+  }
+  const fileName = `${safeTeamId}.${extension}`;
+  await writeFile(path.join(TEAM_LOGO_DIR, fileName), bytes);
+  return { logoUrl: `/uploads/team-logos/${fileName}` };
+}
+
+function isLegalFantasyPosition(position) {
+  return LEGAL_FANTASY_POSITIONS.has(position);
 }
 
 function applyFamilySetup(db) {
@@ -1607,14 +1716,14 @@ function swapDraftPicks(db, firstPickNumber, secondPickNumber) {
 function chooseAutoPick(db) {
   normalizeDraftState(db);
   const teamId = getDraftTeamId(db.league.draft);
-  const queued = (db.league.draft.queues?.[teamId] || []).map((id) => db.players.find((player) => player.id === id)).find((player) => player && !player.ownership && player.status !== "Out");
+  const queued = (db.league.draft.queues?.[teamId] || []).map((id) => db.players.find((player) => player.id === id)).find((player) => player && isLegalFantasyPosition(player.position) && !player.ownership && player.status !== "Out");
   if (queued) return queued;
   const existing = db.players.filter((player) => player.ownership === teamId);
   const counts = existing.reduce((acc, player) => ({ ...acc, [player.position]: (acc[player.position] || 0) + 1 }), {});
   const desired = ["QB", "RB", "WR", "TE", "RB", "WR", "K", "D/ST", "QB", "RB", "WR", "TE", "RB", "WR", "FLEX"];
   const round = Math.ceil(Number(db.league.draft.currentPick || 1) / db.league.draft.order.length);
   const target = desired[Math.min(desired.length - 1, round - 1)];
-  const available = db.players.filter((player) => !player.ownership && player.status !== "Out");
+  const available = db.players.filter((player) => isLegalFantasyPosition(player.position) && !player.ownership && player.status !== "Out");
   const positionPool = available.filter((player) => target === "FLEX" ? ["RB", "WR", "TE"].includes(player.position) : player.position === target);
   const pool = positionPool.length ? positionPool : available;
   return pool.sort((a, b) => {
@@ -1628,13 +1737,13 @@ function chooseAutoPick(db) {
 function chooseMockDraftPick(db, strategy = "balanced") {
   if (strategy === "best_available") {
     return db.players
-      .filter((player) => !player.ownership && player.status !== "Out")
+      .filter((player) => isLegalFantasyPosition(player.position) && !player.ownership && player.status !== "Out")
       .sort((a, b) => b.projection - a.projection || a.name.localeCompare(b.name))[0];
   }
   if (strategy === "upside") {
     const weights = { RB: 1.35, WR: 1.32, TE: 1.12, QB: 0.92, K: 0.7, "D/ST": 0.76 };
     return db.players
-      .filter((player) => !player.ownership && player.status !== "Out")
+      .filter((player) => isLegalFantasyPosition(player.position) && !player.ownership && player.status !== "Out")
       .sort((a, b) => (b.projection * (weights[b.position] || 1)) - (a.projection * (weights[a.position] || 1)) || a.name.localeCompare(b.name))[0];
   }
   return chooseAutoPick(db);
@@ -2218,6 +2327,217 @@ function updatePlayoffBracketFromFinals(db, week) {
   }
 }
 
+const SEASON_SIM_SOURCE_SEASON = 2025;
+const SEASON_SIM_REGULAR_WEEKS = 14;
+const SEASON_SIM_PLAYOFF_WEEKS = [15, 16];
+
+function seasonSimState(db) {
+  const sim = db.meta.seasonSim || {};
+  const draft = normalizeDraftState(db);
+  const rosteredTeams = (db.teams || []).filter((team) => (db.players || []).some((player) => player.ownership === team.id));
+  const completedWeeks = sim.completedWeeks || [];
+  const bracket = db.league.playoffs?.bracket || null;
+  const blockers = [];
+  if ((db.teams || []).length < 4) blockers.push("Create at least four teams before running a full championship simulation.");
+  if (draft.status !== "complete" && rosteredTeams.length < (db.teams || []).length) blockers.push("Draft rosters before advancing season weeks.");
+  return {
+    enabled: Boolean(sim.enabled),
+    sourceSeason: sim.sourceSeason || SEASON_SIM_SOURCE_SEASON,
+    regularSeasonWeeks: sim.regularSeasonWeeks || SEASON_SIM_REGULAR_WEEKS,
+    playoffWeeks: sim.playoffWeeks || SEASON_SIM_PLAYOFF_WEEKS,
+    stage: sim.stage || inferSeasonSimStage(db),
+    currentWeek: Number(db.meta.currentWeek || 1),
+    seasonPhase: normalizeSeasonPhase(db),
+    teams: (db.teams || []).length,
+    users: (db.users || []).length,
+    rosteredTeams: rosteredTeams.length,
+    draftStatus: draft.status,
+    completedWeeks,
+    completedWeekCount: completedWeeks.length,
+    matchups: (db.matchups || []).length,
+    championTeamId: bracket?.championTeamId || sim.championTeamId || null,
+    championName: bracket?.championTeamId ? db.teams.find((team) => team.id === bracket.championTeamId)?.name || null : null,
+    lastActionAt: sim.lastActionAt || null,
+    lastResult: sim.lastResult || null,
+    blockers,
+    nextAction: seasonSimNextAction(db, blockers)
+  };
+}
+
+function inferSeasonSimStage(db) {
+  const phase = normalizeSeasonPhase(db);
+  if (phase === "offseason") return "complete";
+  if (phase === "playoffs") return "playoffs";
+  if (phase === "regular_season") return "regular_season";
+  if (normalizeDraftState(db).status === "complete") return "schedule_ready";
+  if ((db.teams || []).length < 4) return "signup";
+  return "draft_ready";
+}
+
+function seasonSimNextAction(db, blockers = []) {
+  if ((db.teams || []).length < 4) return "Create manager accounts and teams.";
+  const draft = normalizeDraftState(db);
+  if (draft.status !== "complete") return "Run or complete the draft.";
+  if (normalizeSeasonPhase(db) === "offseason") return "Review champion and final standings.";
+  if (blockers.length) return blockers[0];
+  return `Advance Week ${Number(db.meta.currentWeek || 1)}.`;
+}
+
+function prepareSeasonSim(db) {
+  db.meta.season = SEASON_SIM_SOURCE_SEASON;
+  db.meta.currentWeek = 1;
+  db.meta.seasonPhase = (db.teams || []).length >= 4 ? "draft" : "preseason";
+  db.meta.seasonSim = {
+    enabled: true,
+    sourceSeason: SEASON_SIM_SOURCE_SEASON,
+    regularSeasonWeeks: SEASON_SIM_REGULAR_WEEKS,
+    playoffWeeks: SEASON_SIM_PLAYOFF_WEEKS,
+    completedWeeks: [],
+    stage: (db.teams || []).length >= 4 ? "draft_ready" : "signup",
+    lastActionAt: new Date().toISOString(),
+    lastResult: "Season sim reset. Create teams, draft, then advance weeks."
+  };
+  clearRosters(db);
+  db.lineups = Object.fromEntries((db.teams || []).map((team) => [team.id, {}]));
+  for (const team of db.teams || []) Object.assign(team, { wins: 0, losses: 0, ties: 0 });
+  db.matchups = (db.teams || []).length >= 2 ? generateSchedule(db.teams, SEASON_SIM_REGULAR_WEEKS, 1) : [];
+  db.transactions = [];
+  db.waiverClaims = [];
+  db.trades = [];
+  db.scoreCorrections = [];
+  db.lineupLocks = [];
+  db.weeklyPlayerStats = (db.weeklyPlayerStats || []).filter((item) => item.provider !== "season-sim-2025");
+  db.league.playoffs = { ...db.league.playoffs, weeks: `${SEASON_SIM_PLAYOFF_WEEKS[0]} & ${SEASON_SIM_PLAYOFF_WEEKS[1]}`, bracket: null };
+  db.league.draft = { ...makeDraftState((db.teams || []).map((team) => team.id)), rounds: Number(db.league.draft?.rounds || 15) };
+  return seasonSimState(db);
+}
+
+function runSeasonSimDraft(db) {
+  if ((db.teams || []).length < 4) return { error: "Create at least four teams before running the season sim draft." };
+  db.meta.season = SEASON_SIM_SOURCE_SEASON;
+  db.meta.seasonPhase = "draft";
+  db.league.draft = { ...normalizeDraftState(db), order: (db.teams || []).map((team) => team.id) };
+  const availableRounds = Math.max(1, Math.floor((db.players || []).filter((player) => player.status !== "Out").length / Math.max(1, db.teams.length)));
+  runTestDraft(db, Math.min(Number(db.league.draft.rounds || 15), availableRounds));
+  db.matchups = generateSchedule(db.teams, SEASON_SIM_REGULAR_WEEKS, 1);
+  db.meta.currentWeek = 1;
+  db.meta.seasonPhase = "regular_season";
+  db.meta.seasonSim = {
+    ...(db.meta.seasonSim || {}),
+    enabled: true,
+    sourceSeason: SEASON_SIM_SOURCE_SEASON,
+    regularSeasonWeeks: SEASON_SIM_REGULAR_WEEKS,
+    playoffWeeks: SEASON_SIM_PLAYOFF_WEEKS,
+    completedWeeks: [],
+    stage: "regular_season",
+    lastActionAt: new Date().toISOString(),
+    lastResult: `Drafted ${(db.teams || []).length} teams and generated a ${SEASON_SIM_REGULAR_WEEKS}-week schedule.`
+  };
+  return seasonSimState(db);
+}
+
+function simulateSeasonWeek(db) {
+  const state = seasonSimState(db);
+  if ((db.teams || []).length < 4) return { error: "Create at least four teams before advancing the sim." };
+  if (state.draftStatus !== "complete") return { error: "Complete the draft before advancing the sim." };
+  const week = Number(db.meta.currentWeek || 1);
+  if (normalizeSeasonPhase(db) === "offseason") return { error: "Season simulation is already complete." };
+  if (week > SEASON_SIM_REGULAR_WEEKS && !db.league.playoffs?.bracket) generatePlayoffBracket(db);
+  seedSeasonSimStats(db, SEASON_SIM_SOURCE_SEASON, week);
+  const result = processWeekScoring(db, SEASON_SIM_SOURCE_SEASON, week, { finalize: true, useProjections: false });
+  const completedWeeks = [...new Set([...(db.meta.seasonSim?.completedWeeks || []), week])].sort((a, b) => a - b);
+  if (week < SEASON_SIM_REGULAR_WEEKS) {
+    db.meta.currentWeek = week + 1;
+    db.meta.seasonPhase = "regular_season";
+  } else if (week === SEASON_SIM_REGULAR_WEEKS) {
+    db.meta.currentWeek = SEASON_SIM_PLAYOFF_WEEKS[0];
+    db.meta.seasonPhase = "playoffs";
+    generatePlayoffBracket(db);
+  } else if (week === SEASON_SIM_PLAYOFF_WEEKS[0]) {
+    db.meta.currentWeek = SEASON_SIM_PLAYOFF_WEEKS[1];
+    db.meta.seasonPhase = "playoffs";
+  } else {
+    db.meta.seasonPhase = "offseason";
+  }
+  const bracket = db.league.playoffs?.bracket;
+  db.meta.seasonSim = {
+    ...(db.meta.seasonSim || {}),
+    enabled: true,
+    completedWeeks,
+    stage: db.meta.seasonPhase === "offseason" ? "complete" : db.meta.seasonPhase,
+    championTeamId: bracket?.championTeamId || null,
+    lastActionAt: new Date().toISOString(),
+    lastResult: `Finalized Week ${week} with ${result.matchups} matchup(s) and ${result.statRows} player result(s).`
+  };
+  return { ...seasonSimState(db), processed: result };
+}
+
+function runSeasonSimToEnd(db) {
+  const weeks = [];
+  for (let guard = 0; guard < 25 && normalizeSeasonPhase(db) !== "offseason"; guard++) {
+    const result = simulateSeasonWeek(db);
+    if (result.error) return result;
+    weeks.push(result.processed.week);
+  }
+  return { ...seasonSimState(db), weeks };
+}
+
+function seedSeasonSimStats(db, season, week) {
+  const source = "season-sim-2025";
+  db.weeklyPlayerStats = (db.weeklyPlayerStats || []).filter((item) => !(item.provider === source && item.season === season && item.week === week));
+  const owned = (db.players || []).filter((player) => player.ownership);
+  const now = new Date().toISOString();
+  for (const player of owned) {
+    const profile = simNflTeamProfile(player.nflTeam, week);
+    const fantasyPoints = simFantasyPoints(player, week, profile);
+    db.weeklyPlayerStats.push({
+      id: `${source}-${season}-${week}-${player.id}`,
+      provider: source,
+      providerId: player.id,
+      appPlayerId: player.id,
+      season,
+      week,
+      statType: "actual",
+      stats: { sim_points: fantasyPoints, team_result_profile: profile.label },
+      fantasyPoints,
+      raw: { sourceSeason: season, week, nflTeam: player.nflTeam, profile },
+      syncedAt: now
+    });
+  }
+  db.providerSync = db.providerSync || { provider: "mock", lastRunAt: null, message: "", details: {} };
+  db.providerSync.lastRunAt = now;
+  db.providerSync.message = `Season sim loaded ${owned.length} replay result(s) for 2025 Week ${week}.`;
+  db.providerSync.details = { ...(db.providerSync.details || {}), scoring: { provider: source, season, week, rows: owned.length, status: "simulated" } };
+  return owned.length;
+}
+
+function simFantasyPoints(player, week, profile) {
+  const baseByPosition = { QB: 18, RB: 10.5, WR: 10, TE: 7.5, K: 7.2, "D/ST": 7.8 };
+  const base = Number(player.projection || baseByPosition[player.position] || 6);
+  const positionTilt = player.position === "QB" ? profile.pass : player.position === "RB" ? profile.rush : player.position === "WR" || player.position === "TE" ? profile.pass : profile.special;
+  const variance = ((stableHash(`${player.id}:${week}:2025`) % 900) / 100) - 3.5;
+  return roundScore(Math.max(0, base * profile.team * positionTilt + variance));
+}
+
+function simNflTeamProfile(team = "FA", week = 1) {
+  const hash = stableHash(`${team}:${week}:2025`);
+  const teamScore = 0.82 + ((hash % 44) / 100);
+  const pass = 0.9 + (((hash >> 3) % 24) / 100);
+  const rush = 0.9 + (((hash >> 5) % 24) / 100);
+  const special = 0.88 + (((hash >> 7) % 28) / 100);
+  const labels = ["low-scoring win", "shootout", "defensive grind", "road split", "late rally", "division game"];
+  return { team: teamScore, pass, rush, special, label: labels[hash % labels.length] };
+}
+
+function stableHash(value = "") {
+  let hash = 2166136261;
+  for (const char of String(value)) {
+    hash ^= char.charCodeAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
 function scoringSummary(db) {
   const season = Number(db.meta?.season || 0);
   const week = Number(db.meta?.currentWeek || 0);
@@ -2326,6 +2646,7 @@ function validateRosterMove(db, teamId, options = {}) {
   const drop = dropPlayerId ? db.players.find((player) => player.id === dropPlayerId) : null;
   if (!team) errors.push("Team not found");
   if (addPlayerId && !add) errors.push("Added player not found");
+  if (add && !isLegalFantasyPosition(add.position)) errors.push(`${add.name} has unsupported fantasy position ${add.position || "UNK"}`);
   if (add && add.ownership) errors.push(`${add.name} is already rostered`);
   if (dropPlayerId && !drop) errors.push("Dropped player not found");
   if (drop && drop.ownership !== teamId) errors.push(`${drop.name} is not on this roster`);
@@ -2689,9 +3010,13 @@ function validateLeagueRules(payload = {}) {
   const trade = payload.trade || {};
   const playoffs = payload.playoffs || {};
   const starters = roster.starters || [];
+  const allowedSlots = new Set(["QB", "RB", "WR", "TE", "FLEX", "K", "D/ST"]);
   if (!Array.isArray(starters) || starters.length < 1) errors.push("At least one starting roster slot is required.");
+  for (const slot of starters) if (!allowedSlots.has(slot)) errors.push(`${slot} is not a supported roster slot.`);
   if (Number(roster.bench) < 0 || Number(roster.ir) < 0) errors.push("Bench and IR slots cannot be negative.");
-  if (Number(payload.settings?.maxRosterSize || 0) < starters.length) errors.push("Max roster size must cover all starting slots.");
+  if (payload.settings?.maxRosterSize !== undefined && Number(payload.settings.maxRosterSize || 0) < starters.length) errors.push("Max roster size must cover all starting slots.");
+  if (Number(payload.currentWeek || 1) < 1 || Number(payload.currentWeek || 1) > 22) errors.push("Current week must be between 1 and 22.");
+  if (payload.settings?.maxTeams !== undefined && (Number(payload.settings.maxTeams || 0) < 2 || Number(payload.settings.maxTeams || 0) > 20)) errors.push("Max teams must be between 2 and 20.");
   for (const [key, value] of Object.entries(scoring)) {
     if (!Number.isFinite(Number(value))) errors.push(`${labelForPhase(key)} scoring must be numeric.`);
   }
@@ -2708,7 +3033,6 @@ function updateLeagueRepository(db, payload = {}) {
   const validation = validateLeagueRules(payload);
   if (!validation.ok) return { error: validation.errors.join("; "), validation };
   if (payload.name) db.league.name = String(payload.name).slice(0, 80);
-  if (payload.season) db.meta.season = Number(payload.season);
   if (payload.currentWeek) db.meta.currentWeek = Number(payload.currentWeek);
   if (payload.settings) db.league.settings = { ...db.league.settings, ...payload.settings };
   if (payload.roster) db.league.roster = { ...db.league.roster, ...payload.roster };
@@ -2726,7 +3050,7 @@ function firstLoginOnboarding(db, user) {
   const steps = [
     { id: "password", label: "Change seeded password", done: !hasSeededPassword(user), view: "settings" },
     { id: "profile", label: "Confirm profile and contact", done: Boolean(user?.email), view: "settings" },
-    { id: "team", label: "Set team name, initials, color, or logo", done: Boolean(team?.logoUrl) || !defaultTeamName, view: "settings" },
+    { id: "team", label: "Set team name, initials, color, or logo", done: Boolean(team?.logoUrl) || !defaultTeamName, view: "team", tab: "roster" },
     { id: "notifications", label: "Choose notification digest preferences", done: Boolean((db.notificationPreferences || []).find((pref) => pref.userId === user?.id)), view: "settings" }
   ];
   return { complete: steps.every((step) => step.done), steps, inviteInstructions: inviteResetInstructions(db) };
@@ -2975,6 +3299,7 @@ function reactToChat(db, chatId, userId, reaction = "+1") {
 
 function realisticLeagueFixture() {
   const db = initialDb();
+  applyFamilySetup(db);
   db.meta.seasonPhase = "regular_season";
   db.meta.currentWeek = 8;
   db.matchups = generateSchedule(db.teams, 14, 1);
@@ -3270,13 +3595,21 @@ function duplicatePlayerEntries(db) {
 }
 
 function providerMappingCandidates(db, limit = 30) {
-  const mappedProviderIds = new Set(Object.values(db.meta?.providerMappings || {}));
+  const mappedProviderIds = new Set(Object.keys(db.meta?.providerMappings || {}));
   const localNames = new Map((db.players || []).map((player) => [player.name.toLowerCase(), player]));
+  const localLastNameTeam = new Map();
+  for (const player of db.players || []) {
+    const last = String(player.name || "").split(" ").at(-1)?.toLowerCase() || "";
+    if (!last) continue;
+    const keys = [`${last}|${player.nflTeam || ""}`, `${last}|`];
+    for (const key of keys) if (!localLastNameTeam.has(key)) localLastNameTeam.set(key, player);
+  }
   return (db.providerPlayers || [])
     .filter((provider) => !mappedProviderIds.has(provider.id))
     .map((provider) => {
       const exact = localNames.get(String(provider.name || "").toLowerCase());
-      const fuzzy = exact || (db.players || []).find((player) => player.name.split(" ").at(-1)?.toLowerCase() === String(provider.lastName || "").toLowerCase() && (!provider.team || player.nflTeam === provider.team));
+      const last = String(provider.lastName || "").toLowerCase();
+      const fuzzy = exact || localLastNameTeam.get(`${last}|${provider.team || ""}`) || localLastNameTeam.get(`${last}|`);
       return {
         providerId: provider.id,
         providerName: provider.name,
@@ -3291,6 +3624,8 @@ function providerMappingCandidates(db, limit = 30) {
 }
 
 function dataQualityReport(db) {
+  const signature = `${db.players?.length || 0}:${db.providerPlayers?.length || 0}:${db.teams?.length || 0}:${db.users?.length || 0}:${Object.keys(db.lineups || {}).length}`;
+  if (db.__dataQualityCache?.signature === signature) return db.__dataQualityCache.report;
   const references = validateDbReferences(db);
   const duplicates = duplicatePlayerGroups(db);
   const rosterValidations = validateAllRosters(db);
@@ -3300,7 +3635,7 @@ function dataQualityReport(db) {
     ...duplicates.map((group) => `Duplicate player group: ${group.key}`),
     ...rosterValidations.filter((item) => !item.valid).map((item) => `${item.teamName}: ${item.errors.join("; ")}`)
   ];
-  return {
+  const report = {
     ok: warnings.length === 0,
     warnings,
     references,
@@ -3314,6 +3649,8 @@ function dataQualityReport(db) {
       providerCandidates: providerCandidates.length
     }
   };
+  Object.defineProperty(db, "__dataQualityCache", { value: { signature, report }, enumerable: false, configurable: true });
+  return report;
 }
 
 function providerSettings(db) {
@@ -3833,7 +4170,7 @@ async function handleApi(req, res, db) {
     if (!user || hashPassword(password || "", user.salt) !== user.passwordHash) return send(res, 401, { error: "Invalid username or password" });
     const token = cookieSession(user.id);
     db.sessions.push({ token, userId: user.id, createdAt: Date.now(), expiresAt: Date.now() + 1000 * 60 * 60 * 24 * 14 });
-    await saveDb(db);
+    await saveSessionsOnly(db.sessions);
     return send(res, 200, { user: safeUser(user), csrfToken: csrfTokenForSession(token) }, { "Set-Cookie": `ff_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=1209600` });
   }
   if (url.pathname === "/api/password-reset" && req.method === "POST") {
@@ -3847,7 +4184,7 @@ async function handleApi(req, res, db) {
   if (url.pathname === "/api/logout" && req.method === "POST") {
     const raw = parseCookies(req).ff_session;
     db.sessions = db.sessions.filter((session) => session.token !== raw);
-    await saveDb(db);
+    await saveSessionsOnly(db.sessions);
     return send(res, 200, { ok: true }, { "Set-Cookie": "ff_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0" });
   }
 
@@ -3862,6 +4199,9 @@ async function handleApi(req, res, db) {
   if (url.pathname === "/api/bootstrap" && req.method === "GET") {
     return send(res, 200, { ...enrich(db, user), csrfToken: csrfTokenForSession(getSessionCookie(req)) });
   }
+  if (url.pathname === "/api/players/catalog" && req.method === "GET") {
+    return send(res, 200, fullPlayerCatalogResponse(db, Object.fromEntries(url.searchParams.entries())));
+  }
   if (url.pathname === "/api/sessions" && req.method === "GET") {
     const current = getSessionCookie(req);
     const sessions = (db.sessions || [])
@@ -3872,7 +4212,7 @@ async function handleApi(req, res, db) {
   if (url.pathname === "/api/sessions/revoke-others" && req.method === "POST") {
     const current = getSessionCookie(req);
     db.sessions = (db.sessions || []).filter((session) => session.userId !== user.id || session.token === current);
-    await saveDb(db);
+    await saveSessionsOnly(db.sessions);
     return send(res, 200, { ok: true });
   }
   if (url.pathname === "/api/health" && req.method === "GET") {
@@ -3932,13 +4272,19 @@ async function handleApi(req, res, db) {
     if (!username || !password || db.users.some((item) => item.username === username)) return send(res, 400, { error: "Unique username and password are required" });
     const newUser = makeUser(`u${Date.now()}`, username, displayName || username, role, password);
     db.users.push(newUser);
+    let assignedTeam = null;
     if (teamId) {
       const team = db.teams.find((item) => item.id === teamId);
-      if (team) team.ownerUserId = newUser.id;
+      if (team) {
+        team.ownerUserId = newUser.id;
+        assignedTeam = team;
+      }
+    } else if (role !== "commissioner") {
+      assignedTeam = createTeamForUser(db, newUser);
     }
-    logActivity(db, { category: "commissioner", type: "user_created", title: "Account created", body: `${user.displayName} created an account for ${newUser.displayName}.`, actorUserId: user.id, audience: "commissioner" });
+    logActivity(db, { category: "commissioner", type: "user_created", title: "Account created", body: `${user.displayName} created an account${assignedTeam ? ` and team ${assignedTeam.name}` : ""} for ${newUser.displayName}.`, actorUserId: user.id, audience: "commissioner", metadata: { teamId: assignedTeam?.id || null } });
     await saveDb(db);
-    return send(res, 201, { user: safeUser(newUser) });
+    return send(res, 201, { user: safeUser(newUser), team: assignedTeam });
   }
   if (url.pathname === "/api/admin/setup-family" && req.method === "POST") {
     if (!requireAdmin(user, res)) return;
@@ -3973,10 +4319,16 @@ async function handleApi(req, res, db) {
     const teamId = url.pathname.split("/")[3];
     const target = db.teams.find((item) => item.id === teamId);
     if (!target || !canManageTeam(user, target)) return send(res, 403, { error: "You cannot edit that team" });
-    const { name, manager, logoUrl, color } = await parseBody(req);
+    const { name, manager, logoUrl, logoUpload, color } = await parseBody(req);
     if (name) target.name = String(name).slice(0, 60);
     if (manager) target.manager = String(manager).slice(0, 4).toUpperCase();
-    if (logoUrl !== undefined) target.logoUrl = cleanUrl(logoUrl);
+    if (logoUpload) {
+      const savedLogo = await saveTeamLogoUpload(target, logoUpload);
+      if (savedLogo.error) return send(res, 400, { error: savedLogo.error });
+      target.logoUrl = savedLogo.logoUrl;
+    } else if (logoUrl !== undefined) {
+      target.logoUrl = cleanUrl(logoUrl);
+    }
     if (color !== undefined) target.color = normalizeTeamColor(color);
     logActivity(db, { category: "commissioner", type: "team_updated", title: "Team updated", body: `${target.name} settings were updated.`, actorUserId: user.id, teamId, audience: "team" });
     await saveDb(db);
@@ -4005,6 +4357,37 @@ async function handleApi(req, res, db) {
     if (!requirePhase(db, res, "playoffs")) return;
     const bracket = generatePlayoffBracket(db);
     logActivity(db, { category: "commissioner", type: "playoff_bracket_generated", title: "Playoff bracket generated", body: `${user.displayName} generated the playoff bracket.`, actorUserId: user.id, audience: "all", metadata: bracket });
+    await saveDb(db);
+    return send(res, 200, enrich(db, user));
+  }
+  if (url.pathname === "/api/admin/season-sim/prepare" && req.method === "POST") {
+    if (!requireAdmin(user, res)) return;
+    const sim = prepareSeasonSim(db);
+    logActivity(db, { category: "commissioner", type: "season_sim_prepared", title: "Season sim prepared", body: `${user.displayName} reset the 2025 season simulation lab.`, actorUserId: user.id, audience: "commissioner", metadata: sim });
+    await saveDb(db);
+    return send(res, 200, enrich(db, user));
+  }
+  if (url.pathname === "/api/admin/season-sim/draft" && req.method === "POST") {
+    if (!requireAdmin(user, res)) return;
+    const sim = runSeasonSimDraft(db);
+    if (sim.error) return send(res, 400, sim);
+    logActivity(db, { category: "draft", type: "season_sim_draft", title: "Season sim draft complete", body: `${user.displayName} ran the 2025 replay draft rehearsal.`, actorUserId: user.id, audience: "all", metadata: sim });
+    await saveDb(db);
+    return send(res, 200, enrich(db, user));
+  }
+  if (url.pathname === "/api/admin/season-sim/next-week" && req.method === "POST") {
+    if (!requireAdmin(user, res)) return;
+    const sim = simulateSeasonWeek(db);
+    if (sim.error) return send(res, 400, sim);
+    logActivity(db, { category: "scoring", type: "season_sim_week", title: "Season sim week advanced", body: `${user.displayName} advanced the 2025 replay through Week ${sim.processed.week}.`, actorUserId: user.id, audience: "all", metadata: sim.processed });
+    await saveDb(db);
+    return send(res, 200, enrich(db, user));
+  }
+  if (url.pathname === "/api/admin/season-sim/run-to-end" && req.method === "POST") {
+    if (!requireAdmin(user, res)) return;
+    const sim = runSeasonSimToEnd(db);
+    if (sim.error) return send(res, 400, sim);
+    logActivity(db, { category: "scoring", type: "season_sim_complete", title: "Season sim completed", body: `${user.displayName} ran the 2025 replay through championship week.`, actorUserId: user.id, audience: "all", metadata: sim });
     await saveDb(db);
     return send(res, 200, enrich(db, user));
   }
@@ -4903,7 +5286,7 @@ async function syncBalldontlie(db) {
     const cursor = db.providerSync?.nextPlayerCursor;
     const playerPath = `/players?per_page=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`;
     const playersPayload = await bdlGet(playerPath, apiKey);
-    const incoming = (playersPayload.data || []).map(mapBdlPlayer).filter((player) => player.name);
+    const incoming = (playersPayload.data || []).map(mapBdlPlayer).filter((player) => player.name && isLegalFantasyPosition(player.position));
     const playersById = new Map(db.players.map((item) => [item.id, item]));
     for (const player of incoming) {
       const existing = playersById.get(player.id);
@@ -4967,7 +5350,7 @@ async function syncBalldontlieCatalogStep(db) {
     const cursor = service.bdlNextPlayerCursor || null;
     const playerPath = `/players?per_page=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`;
     const playersPayload = await bdlGet(playerPath, apiKey);
-    const incoming = (playersPayload.data || []).map(mapBdlPlayer).filter((player) => player.name);
+    const incoming = (playersPayload.data || []).map(mapBdlPlayer).filter((player) => player.name && isLegalFantasyPosition(player.position));
     const playersById = new Map(db.players.map((item) => [item.id, item]));
     const playersByNaturalKey = new Map(db.players.map((item) => [playerNaturalKey(item), item]));
     for (const player of incoming) {
@@ -4996,6 +5379,7 @@ async function syncSleeper(db) {
     const existingSleeperPlayers = (db.providerPlayers || []).filter((player) => player.provider === "sleeper");
     const lastSleeperSync = newestTimestamp(existingSleeperPlayers.map((player) => player.syncedAt));
     if (existingSleeperPlayers.length > 0 && lastSleeperSync && Date.now() - Date.parse(lastSleeperSync) < 23 * 60 * 60 * 1000) {
+      mergeSleeperIntoLeaguePlayers(db, existingSleeperPlayers);
       details.players = `cached ${existingSleeperPlayers.length}; refreshes daily`;
     } else {
       const payload = await sleeperGet("/players/nfl");
@@ -5079,10 +5463,11 @@ function mapBdlGame(game) {
 }
 
 function mapBdlPlayer(player) {
+  const position = normalizeProviderFantasyPosition(player.position_abbreviation || normalizePosition(player.position));
   return {
     id: `bdl-${player.id}`,
     name: `${player.first_name || ""} ${player.last_name || ""}`.trim(),
-    position: player.position_abbreviation || normalizePosition(player.position),
+    position,
     nflTeam: player.team?.abbreviation || "FA",
     opponent: "TBD",
     projection: 0,
@@ -5129,19 +5514,31 @@ function mapSleeperTrend(item, type, lookbackHours, syncedAt) {
 
 function mergeSleeperIntoLeaguePlayers(db, sleeperPlayers) {
   const fantasyPositions = new Set(["QB", "RB", "WR", "TE", "K", "DEF", "D/ST"]);
-  const usefulPlayers = sleeperPlayers
+  const candidatePlayers = sleeperPlayers
     .filter((player) => player.status !== "Inactive")
-    .filter((player) => (player.fantasyPositions || []).some((position) => fantasyPositions.has(position)) || fantasyPositions.has(player.position))
-    .slice(0, 2500);
+    .filter((player) => (player.fantasyPositions || []).some((position) => fantasyPositions.has(position)) || fantasyPositions.has(player.position));
+  const selectedIds = new Set();
+  const usefulPlayers = [
+    ...candidatePlayers
+      .filter((player) => !isSleeperDefense(player))
+      .slice(0, 2500)
+      .filter((player) => {
+        selectedIds.add(player.providerId);
+        return true;
+      }),
+    ...candidatePlayers.filter((player) => isSleeperDefense(player) && !selectedIds.has(player.providerId))
+  ];
   const playersById = new Map((db.players || []).map((player) => [player.id, player]));
   const playersByNaturalKey = new Map((db.players || []).map((player) => [playerNaturalKey(player), player]));
+  const defensesByTeam = new Map((db.players || []).filter((player) => player.position === "D/ST" && player.nflTeam).map((player) => [player.nflTeam, player]));
   for (const sleeper of usefulPlayers) {
     const id = `slp-${sleeper.providerId}`;
+    const position = normalizeSleeperFantasyPosition(sleeper.position);
     const status = sleeper.injuryStatus || sleeper.status || "Healthy";
     const mapped = {
       id,
-      name: sleeper.name,
-      position: sleeper.position === "DEF" ? "D/ST" : sleeper.position || "FLEX",
+      name: position === "D/ST" ? defenseDisplayName(sleeper.name, sleeper.team) : sleeper.name,
+      position,
       nflTeam: sleeper.team || "FA",
       opponent: "TBD",
       projection: 0,
@@ -5149,17 +5546,43 @@ function mergeSleeperIntoLeaguePlayers(db, sleeperPlayers) {
       ownership: null,
       locked: false
     };
-    const existing = playersById.get(id) || playersByNaturalKey.get(playerNaturalKey(mapped));
+    if (!isLegalFantasyPosition(mapped.position)) continue;
+    const existing = playersById.get(id) || (mapped.position === "D/ST" ? defensesByTeam.get(mapped.nflTeam) : null) || playersByNaturalKey.get(playerNaturalKey(mapped));
     if (existing) {
       Object.assign(existing, { ...mapped, id: existing.id, ownership: existing.ownership, locked: existing.locked });
       playersById.set(existing.id, existing);
       playersByNaturalKey.set(playerNaturalKey(existing), existing);
+      if (existing.position === "D/ST" && existing.nflTeam) defensesByTeam.set(existing.nflTeam, existing);
     } else {
       db.players.push(mapped);
       playersById.set(mapped.id, mapped);
       playersByNaturalKey.set(playerNaturalKey(mapped), mapped);
+      if (mapped.position === "D/ST" && mapped.nflTeam) defensesByTeam.set(mapped.nflTeam, mapped);
     }
   }
+}
+
+function isSleeperDefense(player) {
+  return normalizeSleeperFantasyPosition(player.position) === "D/ST" || (player.fantasyPositions || []).some((position) => normalizeSleeperFantasyPosition(position) === "D/ST");
+}
+
+function normalizeSleeperFantasyPosition(position) {
+  const value = String(position || "").toUpperCase();
+  if (value === "DEF" || value === "D/ST") return "D/ST";
+  if (value === "PK") return "K";
+  return value || "FLEX";
+}
+
+function normalizeProviderFantasyPosition(position) {
+  const value = String(position || "").toUpperCase();
+  if (value === "DEF") return "D/ST";
+  if (value === "PK") return "K";
+  return value || "UNK";
+}
+
+function defenseDisplayName(name, team) {
+  const base = String(name || team || "Defense").trim();
+  return /(?:D\/ST|Defense)$/i.test(base) ? base : `${base} D/ST`;
 }
 
 function normalizePlayerStatus(status) {
@@ -5209,8 +5632,8 @@ async function serveStatic(req, res) {
     const info = await stat(filePath);
     if (!info.isFile()) throw new Error("not a file");
     const ext = path.extname(filePath);
-    const contentType = { ".html": "text/html", ".css": "text/css", ".js": "text/javascript", ".json": "application/json", ".svg": "image/svg+xml" }[ext] || "application/octet-stream";
-    const cacheControl = ext === ".html" ? "no-cache" : "public, max-age=3600";
+    const contentType = { ".html": "text/html", ".css": "text/css", ".js": "text/javascript", ".json": "application/json", ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif" }[ext] || "application/octet-stream";
+    const cacheControl = [".html", ".js", ".css"].includes(ext) ? "no-cache" : "public, max-age=3600";
     const etag = `"${info.size}-${Math.floor(info.mtimeMs)}"`;
     if (req.headers["if-none-match"] === etag) {
       res.writeHead(304, { "Cache-Control": cacheControl, ETag: etag });
@@ -5302,6 +5725,7 @@ export {
   launchReadinessChecklist,
   liveOpsReadiness,
   mergePlayers,
+  mergeSleeperIntoLeaguePlayers,
   mergeNotificationPreferences,
   mapEspnStatLine,
   mockedProviderFixtures,
@@ -5322,8 +5746,13 @@ export {
   replaceDraftPick,
   rosterHealthScore,
   schemaMigrationStatus,
+  prepareSeasonSim,
+  runSeasonSimDraft,
+  runSeasonSimToEnd,
   syncProviderDemoMode,
   runSmartPlayerSyncStep,
+  seasonSimState,
+  simulateSeasonWeek,
   targetedPersistenceAudit,
   simulateMockDraft,
   setupReview,

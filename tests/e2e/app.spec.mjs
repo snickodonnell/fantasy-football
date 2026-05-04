@@ -30,6 +30,20 @@ test("draft TV mode and rule settings render", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "League Rules" })).toBeVisible();
 });
 
+test("notifications and smart pickers replace passive dropdown UX", async ({ page, isMobile }) => {
+  await login(page);
+  await page.getByRole("button", { name: /Notifications/i }).click();
+  await expect(page.getByRole("region", { name: "Notifications" })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Mark read/i })).toBeVisible();
+  if (!isMobile) await expect(page.getByRole("button", { name: /Set Lineup/i })).toBeVisible();
+
+  await page.getByRole("link", { name: /Players/i }).click();
+  await expect(page.locator("select")).toHaveCount(0);
+  await expect(page.locator(".smart-picker").first()).toBeVisible();
+  await page.getByPlaceholder("Search available players").first().fill("Lamar");
+  await expect(page.locator(".picker-results").first()).toContainText(/Lamar|No matches/);
+});
+
 test("mobile shell exposes navigation after login", async ({ page, isMobile }) => {
   test.skip(!isMobile, "mobile-only project");
   await login(page);

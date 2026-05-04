@@ -48,7 +48,7 @@ test("league rule validation covers scoring, roster, FAAB, trade, and playoffs",
 });
 
 test("weekly operations produce previews, waiver schedule, lock countdowns, and finalization checks", () => {
-  const db = initialDb();
+  const db = realisticLeagueFixture();
   const weekly = weeklyOperations(db);
 
   assert.ok(weekly.matchupPreviews.length > 0);
@@ -58,7 +58,7 @@ test("weekly operations produce previews, waiver schedule, lock countdowns, and 
 });
 
 test("family engagement and research tools summarize the league", () => {
-  const db = initialDb();
+  const db = realisticLeagueFixture();
   const user = db.users[0];
   const family = familyEngagement(db);
   const research = researchDecisionTools(db, user);
@@ -140,7 +140,7 @@ test("provider demo mode exposes unavailable and delayed scenarios without netwo
 });
 
 test("completed-week score validation compares processed scores to a hand sheet", () => {
-  const db = initialDb();
+  const db = realisticLeagueFixture();
   const season = db.meta.season;
   const week = db.meta.currentWeek;
   const matchup = db.matchups[0];

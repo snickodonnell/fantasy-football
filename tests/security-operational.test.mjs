@@ -54,10 +54,10 @@ test("draft csv import records draft picks while assigning rosters", () => {
   const player = db.players.find((item) => item.id === "p23");
   player.ownership = null;
 
-  const result = importRosterCsv(db, "team,player,round,pick\nEmily's Team,Puka Nacua,2,9", "draft");
+  const result = importRosterCsv(db, "team,player,round,pick\nNick's Team,Puka Nacua,2,9", "draft");
 
   assert.equal(result.assigned, 1);
-  assert.equal(player.ownership, "t2");
+  assert.equal(player.ownership, "t1");
   assert.equal(db.league.draft.picks.at(-1).playerId, "p23");
   assert.equal(db.league.draft.picks.at(-1).round, 2);
 });

@@ -1,0 +1,47 @@
+Illegal player positions audit
+Generated from data/app.sqlite on 2026-05-04.
+
+Legal fantasy roster positions currently allowed by the app:
+QB, RB, WR, TE, FLEX, K, D/ST
+
+Summary:
+UNK: 4203
+LB: 215
+CB: 172
+S: 129
+DT: 127
+DE: 117
+FB: 74
+OT: 33
+P: 33
+G: 30
+PK: 30
+LS: 27
+C: 18
+DB: 3
+KR: 1
+OG: 1
+SS: 1
+
+Samples by position:
+UNK: bdl-21253 | A.J. Feeley | PHI; bdl-46768 | A.J. Green | ARI; bdl-31570 | A.J. Hawk | CIN; bdl-45617 | A.J. Jefferson | ARI; bdl-7884 | A.J. Klein | BUF; bdl-30942 | A.J. Schable | ARI; bdl-16 | AJ McCarron | CIN; bdl-2268 | AJ Parker | DET
+LB: bdl-2102 | Akeem Davis-Gaither | IND; bdl-1444 | Alex Anzalone | DET; bdl-1345 | Alex Highsmith | PIT; bdl-1491 | Alex Singleton | DEN; bdl-2224 | Amen Ogbongbemiga | CHI; bdl-2711 | Andre Carter II | WSH; bdl-2614 | Andrew Farmer | SF; bdl-1359 | Andrew Van Ginkel | MIN
+CB: bdl-2226 | A.J. Green III | MIA; bdl-2295 | A.J. Terrell Jr. | ATL; bdl-1977 | Adoree' Jackson | PHI; bdl-1991 | Ahkello Witherspoon | LAR; bdl-2403 | Akayleb Evans | CAR; bdl-2641 | Alex Austin | MIA; bdl-1654 | Alontae Taylor | NO; bdl-2442 | Ambry Thomas | PHI
+S: bdl-2646 | AJ Finley | SEA; bdl-2239 | Alohi Gilman | LAC; bdl-756 | Amani Hooker | TEN; bdl-1705 | Andre Cisco | NYJ; bdl-2113 | Andrew Wingard | JAX; bdl-2525 | Anthony Johnson Jr. | NYG; bdl-1362 | Antoine Winfield Jr. | TB; bdl-1668 | Antonio Johnson | JAX
+DT: bdl-1378 | Adam Butler | LV; bdl-1571 | Adam Gotsis | TB; bdl-1556 | Adetomiwa Adebawore | IND; bdl-1387 | Alim McNeill | DET; bdl-1911 | Andrew Billings | ARI; bdl-1377 | Arik Armstead | JAX; bdl-1856 | Austin Johnson | JAX; bdl-1396 | B.J. Hill | CIN
+DE: bdl-1936 | A'Shawn Robinson | CAR; bdl-1353 | AJ Epenesa | BUF; bdl-1304 | Aidan Hutchinson | DET; bdl-1389 | Alex Wright | CLE; bdl-2423 | Andre Jones Jr. | BUF; bdl-1437 | Brandon Graham | PHI; bdl-1441 | Brent Urban | BAL; bdl-1314 | Bryce Huff | SF
+FB: bdl-699 | Adam Prentice | DEN; slp-8025 | Adam Prentice | DEN; bdl-775 | Alec Ingold | LAC; slp-6109 | Alec Ingold | LAC; slp-4226 | Alex Armah | FA; slp-4673 | Algernon Brown | FA; bdl-748 | Andrew Beck | NYJ; slp-3572 | Andrew Bonnet | FA
+OT: bdl-2730 | Anton Harrison | JAX; bdl-2660 | Broderick Jones | PIT; bdl-2331 | Carter Warren | MIA; bdl-31426 | Chad Slaughter | LV; bdl-2534 | Christian Darrisaw | MIN; bdl-1767 | Cornelius Lucas | CLE; bdl-1826 | D.J. Humphries | LAR; bdl-1249 | Dan Skipper | DET
+P: bdl-7712 | AJ Cole | LV; bdl-711 | Blake Gillikin | ARI; bdl-2441 | Brad Robbins | LV; bdl-7 | Braden Mann | PHI; bdl-7613 | Bradley Pinion | ATL; slp-7296 | Brandon Wright | FA; bdl-1730 | Bryan Anger | DAL; bdl-2314 | Bryce Baringer | NE
+G: bdl-2715 | Ben Bartch | DET; bdl-1277 | Ben Bredeson | TB; bdl-2223 | Ben Powers | DEN; bdl-2043 | Chris Lindstrom | ATL; bdl-8043 | Cody Mauch | TB; bdl-1254 | Cole Strange | LAC; bdl-2255 | Cordell Volson | TEN; bdl-7611 | Corey Levin | ATL
+PK: bdl-7543 | Blake Grupe | IND; bdl-7529 | Brandon Aubrey | DAL; bdl-1752 | Brandon McManus | GB; bdl-7508 | Cairo Santos | CHI; bdl-2536 | Cameron Dicker | LAC; bdl-7547 | Chad Ryland | ARI; bdl-7523 | Chase McLaughlin | TB; bdl-7507 | Chris Boswell | PIT
+LS: bdl-2398 | Alex Ward | LV; bdl-1736 | Andrew DePaola | MIN; bdl-2330 | Cal Adomitis | PIT; bdl-1769 | Casey Kreiter | ARI; bdl-1734 | Charley Hughlett | PHI; bdl-2455 | Chris Stoll | SEA; bdl-1854 | Christian Kuntz | PIT; bdl-1714 | JJ Jansen | CAR
+C: bdl-2243 | Aaron Brewer | MIA; bdl-2139 | Andre James | LV; bdl-2528 | Cade Mays | DET; bdl-2502 | Cam Jurgens | PHI; bdl-1924 | Coleman Shelton | LAR; bdl-2153 | Connor McGovern | BUF; bdl-2341 | Creed Humphrey | KC; bdl-2383 | Drew Dalman | CHI
+DB: bdl-39193 | Brandon Harrison | HOU; bdl-32876 | Jovon Johnson | PIT; bdl-23744 | Tony Bua | MIA
+KR: bdl-2146 | Greg Joseph | MIN
+OG: bdl-32480 | Jeb Terry | TB
+SS: slp-2784 | Jameill Showers | FA
+
+Notes:
+PK should likely be normalized into K during future balldontlie syncs; that normalization is now in code for newly synced rows.
+The current pass does not delete historical rows from SQLite. It hides/disallows unsupported positions from fantasy player pools and roster/draft moves so the synced provider cache remains available for analysis.
